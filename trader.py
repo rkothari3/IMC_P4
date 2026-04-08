@@ -1,5 +1,6 @@
 from datamodel import OrderDepth, TradingState, Order
 from typing import List
+import math
 
 
 class Trader:
@@ -9,78 +10,136 @@ class Trader:
 
     def run(self, state: TradingState):
         result = {}
-
+        # EMERALDS — fixed fair value at 10000
         if "EMERALDS" in state.order_depths:
             orders: List[Order] = []
-
-            # Constants
             FAIR_VALUE = 10000
             POSITION_LIMIT = 80
 
-            # TODO: Get current EMERALDS position from state.position
-            #       Use .get() with default 0 (position dict may be empty on first tick)
             pos = state.position.get("EMERALDS", 0)
-
-            # TODO: Calculate how many more units we're allowed to buy and sell
-            #       max_buy  = how far we are from +80  (POSITION_LIMIT - pos)
-            #       max_sell = how far we are from -80  (POSITION_LIMIT + pos)
             max_buy = POSITION_LIMIT - pos
-            max_sell = POSITION_LIMIT + pos 
+            max_sell = POSITION_LIMIT + pos
 
             order_depth: OrderDepth = state.order_depths["EMERALDS"]
 
-            # Sell orders look like: {10008: -14, 10010: -29}
-            #   - keys   = prices
-            #   - values = NEGATIVE quantities (e.g., -14 means 14 units for sale)
-            #
-            # Loop through sell_orders sorted by price ASCENDING (cheapest first)
-            # For each price below FAIR_VALUE:
-            #   - figure out how many units are available (negate the volume)
-            #   - buy the min of (available, max_buy)
-            #   - append Order("EMERALDS", price, qty)  ← positive qty = BUY
-            #   - subtract from max_buy so we don't exceed the position limit
             for price in sorted(order_depth.sell_orders.keys()):
                 if price < FAIR_VALUE and max_buy > 0:
-                    # TODO: calculate available quantity (remember: volumes are negative!)
                     available = -order_depth.sell_orders[price]
-                    qty = abs(min(available, max_buy))
-                    # TODO: append a BUY order and update max_buy
+                    qty = min(available, max_buy)
                     orders.append(Order("EMERALDS", price, qty))
                     max_buy -= qty
 
-            # Buy orders look like: {9992: 14, 9990: 29}
-            #   - keys   = prices
-            #   - values = POSITIVE quantities
-            #
-            # Loop through buy_orders sorted by price DESCENDING (highest first)
-            # For each price above FAIR_VALUE:
-            #   - sell the min of (available, max_sell)
-            #   - append Order("EMERALDS", price, -qty)  ← negative qty = SELL
-            #   - subtract from max_sell
             for price in sorted(order_depth.buy_orders.keys(), reverse=True):
                 if price > FAIR_VALUE and max_sell > 0:
-                    # TODO: calculate available quantity
                     available = order_depth.buy_orders[price]
                     qty = min(available, max_sell)
-                    # TODO: append a SELL order and update max_sell
                     orders.append(Order("EMERALDS", price, -qty))
                     max_sell -= qty
 
-            # Use whatever buy/sell capacity remains after taking
-            # Post a BID (buy order) at 9998 — we're offering to buy 2 below fair value
-            # Post an ASK (sell order) at 10002 — we're offering to sell 2 above fair value
             if max_buy > 0:
                 orders.append(Order("EMERALDS", 9998, max_buy))
-
             if max_sell > 0:
                 orders.append(Order("EMERALDS", 10002, -max_sell))
 
             result["EMERALDS"] = orders
 
-        # ── Step 5: Return ──────────────────────────────────────────────────
-        # Must return: (result dict, conversions int, traderData string)
-        # conversions = 0 (we don't use conversions for EMERALDS)
-        # traderData = "" (no state to persist for this simple strategy)
+        # TOMATOES — fair value drifts slowly, must estimate each tick
+        #
+        # Unlike EMERALDS where fair value is always 10000, TOMATOES price
+        # wanders around ~5000. We estimate fair value from the order book
+        # each tick, then do the same take + make strategy around it.
+        #
+        # Key difference: TOMATOES is MEAN-REVERTING (if price goes up,
+        # it tends to come back down). This makes market making safer —
+        # if we buy and the price drops, it'll likely recover.
+        #
+        if "TOMATOES" in state.order_depths:
+            orders: List[Order] = []
+            POSITION_LIMIT = 80
+
+            pos = state.position.get("TOMATOES", 0)
+            max_buy = POSITION_LIMIT - pos
+            max_sell = POSITION_LIMIT + pos
+
+            order_depth: OrderDepth = state.order_depths["TOMATOES"]
+
+            # ── Step 1: Estimate fair value ─────────────────────────────────
+            # We need to figure out what TOMATOES is "really worth" right now.
+            #
+            # Method: mid price = (best_bid + best_ask) / 2
+            #   best_bid = highest price someone is willing to buy at
+            #   best_ask = lowest price someone is willing to sell at
+            #
+            # Example: if buy_orders = {4993: 7, 4992: 17}
+            #          and sell_orders = {5007: -7, 5008: -17}
+            #          best_bid = 4993, best_ask = 5007
+            #          fair_value = (4993 + 5007) / 2 = 5000.0
+            #
+            # TODO: Get the best bid price (hint: max() of buy_orders keys)
+            # TODO: Get the best ask price (hint: min() of sell_orders keys)
+            # TODO: Calculate fair_value as their average
+            best_bid = max(order_depth.buy_orders.keys())
+            best_ask = min(order_depth.sell_orders.keys())
+            fair_value = (best_bid + best_ask) / 2
+
+            # ── Step 2: TAKE — buy any sell orders below fair value ─────────
+            # Same logic as EMERALDS, but using our estimated fair_value
+            # instead of a hardcoded 10000.
+            #
+            # Since fair_value is a float (e.g., 5000.5), we buy anything
+            # priced BELOW it. An ask at exactly fair_value is not profitable.
+            #
+            # TODO: Loop through sell_orders sorted ascending
+            #       For each price < fair_value: buy min(available, max_buy)
+            #       Remember: sell_orders volumes are negative!
+            for price in sorted(order_depth.sell_orders.keys()):
+                if price < fair_value and max_buy > 0:
+                    available = -order_depth.sell_orders[price]
+                    qty = min(available, max_buy)
+                    # TODO: append buy order, update max_buy
+                    orders.append(Order("TOMATOES", price, qty))
+                    max_buy -= qty
+
+            # ── Step 3: TAKE — sell into any buy orders above fair value ────
+            # TODO: Loop through buy_orders sorted descending
+            #       For each price > fair_value: sell min(available, max_sell)
+            for price in sorted(order_depth.buy_orders.keys(), reverse=True):
+                if price > fair_value and max_sell > 0:
+                    available = order_depth.buy_orders[price]
+                    qty = min(available, max_sell)
+                    # TODO: append sell order, update max_sell
+                    orders.append(Order("TOMATOES", price, -qty))
+                    max_sell -= qty
+
+            # ── Step 4: MAKE — post passive quotes ──────────────────────────
+            # Post bid/ask around our estimated fair value.
+            #
+            # Since Order prices must be integers, we round:
+            #   bid_price = floor(fair_value) - 1   (buy a bit below)
+            #   ask_price = ceil(fair_value) + 1     (sell a bit above)
+            #
+            # Example: fair_value = 5000.5
+            #   bid_price = floor(5000.5) - 1 = 4999
+            #   ask_price = ceil(5000.5) + 1  = 5002
+            #   → we earn 3 per round trip (buy at 4999, sell at 5002)
+            #
+            # math.floor() rounds down, math.ceil() rounds up
+            #
+            # TODO: Calculate bid_price and ask_price
+            # TODO: Post buy order at bid_price with max_buy quantity
+            # TODO: Post sell order at ask_price with -max_sell quantity
+            bid_price = math.floor(fair_value) - 1
+            ask_price = math.ceil(fair_value) + 1
+
+            if max_buy > 0:
+                # TODO: append buy order at bid_price
+                orders.append(Order("TOMATOES", bid_price, max_buy))
+            if max_sell > 0:
+                # TODO: append sell order at ask_price
+                orders.append(Order("TOMATOES", ask_price, -max_sell))
+
+            result["TOMATOES"] = orders
+
         traderData = ""
         conversions = 0
         return result, conversions, traderData
