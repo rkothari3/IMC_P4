@@ -11,8 +11,8 @@ class Trader:
     EM_SKEW = 0.05
 
     TM_POSITION_LIMIT = 80
-    TM_BASE_EDGE = 3
-    TM_TIGHT_EDGE = 5
+    TM_BASE_EDGE = 5
+    TM_TIGHT_EDGE = 7
     TM_TIGHT_SPREAD_THRESHOLD = 10
     TM_SKEW = 0.05
 
@@ -109,11 +109,12 @@ class Trader:
             bid_vol = order_depth.buy_orders[best_bid]
             ask_vol = -order_depth.sell_orders[best_ask]
 
-            denom = bid_vol + ask_vol
-            if denom > 0:
-                fair_value = (best_bid * ask_vol + best_ask * bid_vol) / denom
-            else:
-                fair_value = (best_bid + best_ask) / 2
+            # Large-order mid (wall mid) - use price with max volume on each side
+            max_bid_price = max(order_depth.buy_orders.keys(),
+                                key=lambda p: order_depth.buy_orders[p])
+            max_ask_price = min(order_depth.sell_orders.keys(),
+                                key=lambda p: -order_depth.sell_orders[p])
+            fair_value = (max_bid_price + max_ask_price) / 2
 
             for price in sorted(order_depth.sell_orders.keys()):
                 max_buy = self.TM_POSITION_LIMIT - pos
