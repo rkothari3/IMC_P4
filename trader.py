@@ -27,25 +27,11 @@ class Trader:
             order_depth: OrderDepth = state.order_depths["EMERALDS"]
             pos = state.position.get("EMERALDS", 0)
 
-            # Flatten inventory at fair value when possible.
-            if pos > 0 and self.EM_FAIR in order_depth.buy_orders:
-                available = order_depth.buy_orders[self.EM_FAIR]
-                qty = min(available, self.EM_POSITION_LIMIT + pos, pos)
-                if qty > 0:
-                    orders.append(Order("EMERALDS", self.EM_FAIR, -qty))
-                    pos -= qty
-            elif pos < 0 and self.EM_FAIR in order_depth.sell_orders:
-                available = -order_depth.sell_orders[self.EM_FAIR]
-                qty = min(available, self.EM_POSITION_LIMIT - pos, -pos)
-                if qty > 0:
-                    orders.append(Order("EMERALDS", self.EM_FAIR, qty))
-                    pos += qty
-
             for price in sorted(order_depth.sell_orders.keys()):
                 max_buy = self.EM_POSITION_LIMIT - pos
                 if max_buy <= 0:
                     break
-                if price < self.EM_FAIR:
+                if price < self.EM_FAIR or (price == self.EM_FAIR and pos < 0):
                     available = -order_depth.sell_orders[price]
                     qty = min(available, max_buy)
                     if qty > 0:
@@ -56,7 +42,7 @@ class Trader:
                 max_sell = self.EM_POSITION_LIMIT + pos
                 if max_sell <= 0:
                     break
-                if price > self.EM_FAIR:
+                if price > self.EM_FAIR or (price == self.EM_FAIR and pos > 0):
                     available = order_depth.buy_orders[price]
                     qty = min(available, max_sell)
                     if qty > 0:
@@ -83,6 +69,34 @@ class Trader:
             if max_sell > 0:
                 orders.append(Order("EMERALDS", ask_price, -max_sell))
 
+            og_pos = state.position.get("EMERALDS", 0)
+            total_buy = sum(o.quantity for o in orders if o.quantity > 0)
+            total_sell = sum(-o.quantity for o in orders if o.quantity < 0)
+            
+            # Trim buys if would exceed +80
+            if og_pos + total_buy > 80:
+                excess = (og_pos + total_buy) - 80
+                for i in range(len(orders) - 1, -1, -1):
+                    if orders[i].quantity > 0 and orders[i].price < self.EM_FAIR:
+                        trim = min(orders[i].quantity, excess)
+                        orders[i].quantity -= trim
+                        excess -= trim
+                        if excess <= 0:
+                            break
+            
+            # Trim sells if would exceed -80
+            if og_pos - total_sell < -80:
+                excess = -((og_pos - total_sell) - 80)
+                for i in range(len(orders) - 1, -1, -1):
+                    if orders[i].quantity < 0 and orders[i].price > self.EM_FAIR:
+                        trim = min(-orders[i].quantity, excess)
+                        orders[i].quantity += trim
+                        excess -= trim
+                        if excess <= 0:
+                            break
+            
+            # Remove zero-quantity orders
+            orders = [o for o in orders if o.quantity != 0]
             result["EMERALDS"] = orders
 
         if "TOMATOES" in state.order_depths:
@@ -105,7 +119,7 @@ class Trader:
                 max_buy = self.TM_POSITION_LIMIT - pos
                 if max_buy <= 0:
                     break
-                if price < fair_value:
+                if price < fair_value or (price <= fair_value and pos < 0):
                     available = -order_depth.sell_orders[price]
                     qty = min(available, max_buy)
                     if qty > 0:
@@ -116,7 +130,7 @@ class Trader:
                 max_sell = self.TM_POSITION_LIMIT + pos
                 if max_sell <= 0:
                     break
-                if price > fair_value:
+                if price > fair_value or (price >= fair_value and pos > 0):
                     available = order_depth.buy_orders[price]
                     qty = min(available, max_sell)
                     if qty > 0:
@@ -150,6 +164,33 @@ class Trader:
             if passive_sell_qty > 0:
                 orders.append(Order("TOMATOES", ask_price, -passive_sell_qty))
 
+            og_pos = state.position.get("TOMATOES", 0)
+            total_buy = sum(o.quantity for o in orders if o.quantity > 0)
+            total_sell = sum(-o.quantity for o in orders if o.quantity < 0)
+            
+            # Trim buys if would exceed +80
+            if og_pos + total_buy > 80:
+                excess = (og_pos + total_buy) - 80
+                for i in range(len(orders) - 1, -1, -1):
+                    if orders[i].quantity > 0 and orders[i].price < math.floor(fair_value):
+                        trim = min(orders[i].quantity, excess)
+                        orders[i].quantity -= trim
+                        excess -= trim
+                        if excess <= 0:
+                            break
+            
+            # Trim sells if would exceed -80
+            if og_pos - total_sell < -80:
+                excess = -((og_pos - total_sell) - 80)
+                for i in range(len(orders) - 1, -1, -1):
+                    if orders[i].quantity < 0 and orders[i].price > math.ceil(fair_value):
+                        trim = min(-orders[i].quantity, excess)
+                        orders[i].quantity += trim
+                        excess -= trim
+                        if excess <= 0:
+                            break
+            
+            orders = [o for o in orders if o.quantity != 0]
             result["TOMATOES"] = orders
 
         print(
