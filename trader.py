@@ -5,140 +5,157 @@ import math
 
 class Trader:
 
+    EM_FAIR = 10000
+    EM_POSITION_LIMIT = 80
+    EM_EDGE = 7
+    EM_SKEW = 0.05
+
+    TM_POSITION_LIMIT = 80
+    TM_BASE_EDGE = 3
+    TM_TIGHT_EDGE = 5
+    TM_TIGHT_SPREAD_THRESHOLD = 10
+    TM_SKEW = 0.05
+
     def bid(self):
         return 15
 
     def run(self, state: TradingState):
         result = {}
-        # EMERALDS — fixed fair value at 10000
+
         if "EMERALDS" in state.order_depths:
             orders: List[Order] = []
-            FAIR_VALUE = 10000
-            POSITION_LIMIT = 80
-
-            pos = state.position.get("EMERALDS", 0)
-            max_buy = POSITION_LIMIT - pos
-            max_sell = POSITION_LIMIT + pos
-
             order_depth: OrderDepth = state.order_depths["EMERALDS"]
+            pos = state.position.get("EMERALDS", 0)
+
+            # Flatten inventory at fair value when possible.
+            if pos > 0 and self.EM_FAIR in order_depth.buy_orders:
+                available = order_depth.buy_orders[self.EM_FAIR]
+                qty = min(available, self.EM_POSITION_LIMIT + pos, pos)
+                if qty > 0:
+                    orders.append(Order("EMERALDS", self.EM_FAIR, -qty))
+                    pos -= qty
+            elif pos < 0 and self.EM_FAIR in order_depth.sell_orders:
+                available = -order_depth.sell_orders[self.EM_FAIR]
+                qty = min(available, self.EM_POSITION_LIMIT - pos, -pos)
+                if qty > 0:
+                    orders.append(Order("EMERALDS", self.EM_FAIR, qty))
+                    pos += qty
 
             for price in sorted(order_depth.sell_orders.keys()):
-                if price < FAIR_VALUE and max_buy > 0:
+                max_buy = self.EM_POSITION_LIMIT - pos
+                if max_buy <= 0:
+                    break
+                if price < self.EM_FAIR:
                     available = -order_depth.sell_orders[price]
                     qty = min(available, max_buy)
-                    orders.append(Order("EMERALDS", price, qty))
-                    max_buy -= qty
+                    if qty > 0:
+                        orders.append(Order("EMERALDS", price, qty))
+                        pos += qty
 
             for price in sorted(order_depth.buy_orders.keys(), reverse=True):
-                if price > FAIR_VALUE and max_sell > 0:
+                max_sell = self.EM_POSITION_LIMIT + pos
+                if max_sell <= 0:
+                    break
+                if price > self.EM_FAIR:
                     available = order_depth.buy_orders[price]
                     qty = min(available, max_sell)
-                    orders.append(Order("EMERALDS", price, -qty))
-                    max_sell -= qty
+                    if qty > 0:
+                        orders.append(Order("EMERALDS", price, -qty))
+                        pos -= qty
 
+            skew = round(pos * self.EM_SKEW)
+            bid_price = self.EM_FAIR - self.EM_EDGE - skew
+            ask_price = self.EM_FAIR + self.EM_EDGE - skew
+
+            if order_depth.sell_orders:
+                best_ask = min(order_depth.sell_orders.keys())
+                bid_price = min(bid_price, best_ask - 1)
+            if order_depth.buy_orders:
+                best_bid = max(order_depth.buy_orders.keys())
+                ask_price = max(ask_price, best_bid + 1)
+            if bid_price >= ask_price:
+                bid_price = ask_price - 1
+
+            max_buy = self.EM_POSITION_LIMIT - pos
+            max_sell = self.EM_POSITION_LIMIT + pos
             if max_buy > 0:
-                orders.append(Order("EMERALDS", 9998, max_buy))
+                orders.append(Order("EMERALDS", bid_price, max_buy))
             if max_sell > 0:
-                orders.append(Order("EMERALDS", 10002, -max_sell))
+                orders.append(Order("EMERALDS", ask_price, -max_sell))
 
             result["EMERALDS"] = orders
 
-        # TOMATOES — fair value drifts slowly, must estimate each tick
-        #
-        # Unlike EMERALDS where fair value is always 10000, TOMATOES price
-        # wanders around ~5000. We estimate fair value from the order book
-        # each tick, then do the same take + make strategy around it.
-        #
-        # Key difference: TOMATOES is MEAN-REVERTING (if price goes up,
-        # it tends to come back down). This makes market making safer —
-        # if we buy and the price drops, it'll likely recover.
-        #
         if "TOMATOES" in state.order_depths:
             orders: List[Order] = []
-            POSITION_LIMIT = 80
-
-            pos = state.position.get("TOMATOES", 0)
-            max_buy = POSITION_LIMIT - pos
-            max_sell = POSITION_LIMIT + pos
-
             order_depth: OrderDepth = state.order_depths["TOMATOES"]
+            pos = state.position.get("TOMATOES", 0)
 
-            # ── Step 1: Estimate fair value ─────────────────────────────────
-            # We need to figure out what TOMATOES is "really worth" right now.
-            #
-            # Method: mid price = (best_bid + best_ask) / 2
-            #   best_bid = highest price someone is willing to buy at
-            #   best_ask = lowest price someone is willing to sell at
-            #
-            # Example: if buy_orders = {4993: 7, 4992: 17}
-            #          and sell_orders = {5007: -7, 5008: -17}
-            #          best_bid = 4993, best_ask = 5007
-            #          fair_value = (4993 + 5007) / 2 = 5000.0
-            #
-            # TODO: Get the best bid price (hint: max() of buy_orders keys)
-            # TODO: Get the best ask price (hint: min() of sell_orders keys)
-            # TODO: Calculate fair_value as their average
             best_bid = max(order_depth.buy_orders.keys())
             best_ask = min(order_depth.sell_orders.keys())
-            fair_value = (best_bid + best_ask) / 2
+            bid_vol = order_depth.buy_orders[best_bid]
+            ask_vol = -order_depth.sell_orders[best_ask]
 
-            # ── Step 2: TAKE — buy any sell orders below fair value ─────────
-            # Same logic as EMERALDS, but using our estimated fair_value
-            # instead of a hardcoded 10000.
-            #
-            # Since fair_value is a float (e.g., 5000.5), we buy anything
-            # priced BELOW it. An ask at exactly fair_value is not profitable.
-            #
-            # TODO: Loop through sell_orders sorted ascending
-            #       For each price < fair_value: buy min(available, max_buy)
-            #       Remember: sell_orders volumes are negative!
+            denom = bid_vol + ask_vol
+            if denom > 0:
+                fair_value = (best_bid * ask_vol + best_ask * bid_vol) / denom
+            else:
+                fair_value = (best_bid + best_ask) / 2
+
             for price in sorted(order_depth.sell_orders.keys()):
-                if price < fair_value and max_buy > 0:
+                max_buy = self.TM_POSITION_LIMIT - pos
+                if max_buy <= 0:
+                    break
+                if price < fair_value:
                     available = -order_depth.sell_orders[price]
                     qty = min(available, max_buy)
-                    # TODO: append buy order, update max_buy
-                    orders.append(Order("TOMATOES", price, qty))
-                    max_buy -= qty
+                    if qty > 0:
+                        orders.append(Order("TOMATOES", price, qty))
+                        pos += qty
 
-            # ── Step 3: TAKE — sell into any buy orders above fair value ────
-            # TODO: Loop through buy_orders sorted descending
-            #       For each price > fair_value: sell min(available, max_sell)
             for price in sorted(order_depth.buy_orders.keys(), reverse=True):
-                if price > fair_value and max_sell > 0:
+                max_sell = self.TM_POSITION_LIMIT + pos
+                if max_sell <= 0:
+                    break
+                if price > fair_value:
                     available = order_depth.buy_orders[price]
                     qty = min(available, max_sell)
-                    # TODO: append sell order, update max_sell
-                    orders.append(Order("TOMATOES", price, -qty))
-                    max_sell -= qty
+                    if qty > 0:
+                        orders.append(Order("TOMATOES", price, -qty))
+                        pos -= qty
 
-            # ── Step 4: MAKE — post passive quotes ──────────────────────────
-            # Post bid/ask around our estimated fair value.
-            #
-            # Since Order prices must be integers, we round:
-            #   bid_price = floor(fair_value) - 1   (buy a bit below)
-            #   ask_price = ceil(fair_value) + 1     (sell a bit above)
-            #
-            # Example: fair_value = 5000.5
-            #   bid_price = floor(5000.5) - 1 = 4999
-            #   ask_price = ceil(5000.5) + 1  = 5002
-            #   → we earn 3 per round trip (buy at 4999, sell at 5002)
-            #
-            # math.floor() rounds down, math.ceil() rounds up
-            #
-            # TODO: Calculate bid_price and ask_price
-            # TODO: Post buy order at bid_price with max_buy quantity
-            # TODO: Post sell order at ask_price with -max_sell quantity
-            bid_price = math.floor(fair_value) - 1
-            ask_price = math.ceil(fair_value) + 1
+            market_spread = best_ask - best_bid
+            if market_spread < self.TM_TIGHT_SPREAD_THRESHOLD:
+                edge = self.TM_TIGHT_EDGE
+                size_mult = 0.5
+            else:
+                edge = self.TM_BASE_EDGE
+                size_mult = 1.0
 
-            if max_buy > 0:
-                # TODO: append buy order at bid_price
-                orders.append(Order("TOMATOES", bid_price, max_buy))
-            if max_sell > 0:
-                # TODO: append sell order at ask_price
-                orders.append(Order("TOMATOES", ask_price, -max_sell))
+            skew = round(pos * self.TM_SKEW)
+            bid_price = math.floor(fair_value) - edge - skew
+            ask_price = math.ceil(fair_value) + edge - skew
+
+            bid_price = min(bid_price, best_ask - 1)
+            ask_price = max(ask_price, best_bid + 1)
+            if bid_price >= ask_price:
+                bid_price = ask_price - 1
+
+            max_buy = self.TM_POSITION_LIMIT - pos
+            max_sell = self.TM_POSITION_LIMIT + pos
+            passive_buy_qty = int(max_buy * size_mult)
+            passive_sell_qty = int(max_sell * size_mult)
+
+            if passive_buy_qty > 0:
+                orders.append(Order("TOMATOES", bid_price, passive_buy_qty))
+            if passive_sell_qty > 0:
+                orders.append(Order("TOMATOES", ask_price, -passive_sell_qty))
 
             result["TOMATOES"] = orders
+
+        print(
+            f"POS {state.timestamp} "
+            + " ".join(f"{p}:{state.position.get(p, 0)}" for p in state.order_depths)
+        )
 
         traderData = ""
         conversions = 0
