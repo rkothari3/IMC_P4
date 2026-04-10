@@ -116,6 +116,12 @@ class Trader:
                                 key=lambda p: -order_depth.sell_orders[p])
             fair_value = (max_bid_price + max_ask_price) / 2
 
+            # Microprice adjustment: shift fair value toward heavy side
+            denom = bid_vol + ask_vol
+            if denom > 0:
+                imbalance = (bid_vol - ask_vol) / denom
+                fair_value += imbalance * 0.5
+
             for price in sorted(order_depth.sell_orders.keys()):
                 max_buy = self.TM_POSITION_LIMIT - pos
                 if max_buy <= 0:
