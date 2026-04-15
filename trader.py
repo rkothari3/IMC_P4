@@ -1,210 +1,103 @@
 from datamodel import OrderDepth, TradingState, Order
 from typing import List
-import math
+
+
+POSITION_LIMIT = 50
 
 
 class Trader:
 
-    EM_FAIR = 10000
-    EM_POSITION_LIMIT = 80
-    EM_EDGE = 7
-    EM_SKEW = 0.05
-
-    TM_POSITION_LIMIT = 80
-    TM_BASE_EDGE = 5
-    TM_TIGHT_EDGE = 7
-    TM_TIGHT_SPREAD_THRESHOLD = 10
-    TM_SKEW = 0.05
-
-    def bid(self):
-        return 15
-
     def run(self, state: TradingState):
         result = {}
 
-        if "EMERALDS" in state.order_depths:
-            orders: List[Order] = []
-            order_depth: OrderDepth = state.order_depths["EMERALDS"]
-            pos = state.position.get("EMERALDS", 0)
+        if "ASH_COATED_OSMIUM" in state.order_depths:
+            result["ASH_COATED_OSMIUM"] = self.trade_aco(state)
 
-            for price in sorted(order_depth.sell_orders.keys()):
-                max_buy = self.EM_POSITION_LIMIT - pos
-                if max_buy <= 0:
-                    break
-                if price < self.EM_FAIR or (price == self.EM_FAIR and pos < 0):
-                    available = -order_depth.sell_orders[price]
-                    qty = min(available, max_buy)
-                    if qty > 0:
-                        orders.append(Order("EMERALDS", price, qty))
-                        pos += qty
+        return result, 0, ""
 
-            for price in sorted(order_depth.buy_orders.keys(), reverse=True):
-                max_sell = self.EM_POSITION_LIMIT + pos
-                if max_sell <= 0:
-                    break
-                if price > self.EM_FAIR or (price == self.EM_FAIR and pos > 0):
-                    available = order_depth.buy_orders[price]
-                    qty = min(available, max_sell)
-                    if qty > 0:
-                        orders.append(Order("EMERALDS", price, -qty))
-                        pos -= qty
+    def trade_aco(self, state: TradingState) -> List[Order]:
+        """
+        Frankfurt StaticTrader logic for ASH_COATED_OSMIUM.
 
-            skew = round(pos * self.EM_SKEW)
-            bid_price = self.EM_FAIR - self.EM_EDGE - skew
-            ask_price = self.EM_FAIR + self.EM_EDGE - skew
+        Fair value = wall_mid = midpoint of (worst bid, worst ask).
+        For a stable mean-reverting ~10000 asset, this reliably anchors near 10000.
 
-            if order_depth.sell_orders:
-                best_ask = min(order_depth.sell_orders.keys())
-                bid_price = min(bid_price, best_ask - 1)
-            if order_depth.buy_orders:
-                best_bid = max(order_depth.buy_orders.keys())
-                ask_price = max(ask_price, best_bid + 1)
-            if bid_price >= ask_price:
-                bid_price = ask_price - 1
+        Strategy:
+          - TAKING: cross any ask <= wall_mid - 1, or any bid >= wall_mid + 1
+                    (also flatten inventory at wall_mid when position is one-sided)
+          - MAKING: queue-improve around wall_mid
+                    bid just above the best bid that is still below wall_mid
+                    ask just below the best ask that is still above wall_mid
+        """
+        orders: List[Order] = []
+        od: OrderDepth = state.order_depths["ASH_COATED_OSMIUM"]
+        pos = state.position.get("ASH_COATED_OSMIUM", 0)
 
-            max_buy = self.EM_POSITION_LIMIT - pos
-            max_sell = self.EM_POSITION_LIMIT + pos
-            if max_buy > 0:
-                orders.append(Order("EMERALDS", bid_price, max_buy))
-            if max_sell > 0:
-                orders.append(Order("EMERALDS", ask_price, -max_sell))
+        if not od.buy_orders or not od.sell_orders:
+            return orders
 
-            og_pos = state.position.get("EMERALDS", 0)
-            total_buy = sum(o.quantity for o in orders if o.quantity > 0)
-            total_sell = sum(-o.quantity for o in orders if o.quantity < 0)
-            
-            # Trim buys if would exceed +80
-            if og_pos + total_buy > 80:
-                excess = (og_pos + total_buy) - 80
-                for i in range(len(orders) - 1, -1, -1):
-                    if orders[i].quantity > 0 and orders[i].price < self.EM_FAIR:
-                        trim = min(orders[i].quantity, excess)
-                        orders[i].quantity -= trim
-                        excess -= trim
-                        if excess <= 0:
-                            break
-            
-            # Trim sells if would exceed -80
-            if og_pos - total_sell < -80:
-                excess = -((og_pos - total_sell) - 80)
-                for i in range(len(orders) - 1, -1, -1):
-                    if orders[i].quantity < 0 and orders[i].price > self.EM_FAIR:
-                        trim = min(-orders[i].quantity, excess)
-                        orders[i].quantity += trim
-                        excess -= trim
-                        if excess <= 0:
-                            break
-            
-            # Remove zero-quantity orders
-            orders = [o for o in orders if o.quantity != 0]
-            result["EMERALDS"] = orders
+        # Sorted book: bids descending, asks ascending, all volumes positive
+        bids = {p: abs(v) for p, v in sorted(od.buy_orders.items(), reverse=True)}
+        asks = {p: abs(v) for p, v in sorted(od.sell_orders.items())}
 
-        if "TOMATOES" in state.order_depths:
-            orders: List[Order] = []
-            order_depth: OrderDepth = state.order_depths["TOMATOES"]
-            pos = state.position.get("TOMATOES", 0)
+        bid_wall = min(bids)          # worst (lowest) bid
+        ask_wall = max(asks)          # worst (highest) ask
+        wall_mid = (bid_wall + ask_wall) / 2
 
-            best_bid = max(order_depth.buy_orders.keys())
-            best_ask = min(order_depth.sell_orders.keys())
-            bid_vol = order_depth.buy_orders[best_bid]
-            ask_vol = -order_depth.sell_orders[best_ask]
+        # Running capacity (decremented as we place orders)
+        buy_cap  = POSITION_LIMIT - pos
+        sell_cap = POSITION_LIMIT + pos
 
-            # Large-order mid (wall mid) - use price with max volume on each side
-            max_bid_price = max(order_depth.buy_orders.keys(),
-                                key=lambda p: order_depth.buy_orders[p])
-            max_ask_price = min(order_depth.sell_orders.keys(),
-                                key=lambda p: -order_depth.sell_orders[p])
-            fair_value = (max_bid_price + max_ask_price) / 2
+        def buy(price, volume):
+            nonlocal buy_cap
+            vol = min(abs(int(volume)), buy_cap)
+            if vol > 0:
+                orders.append(Order("ASH_COATED_OSMIUM", int(price), vol))
+                buy_cap -= vol
 
-            # Microprice adjustment: shift fair value toward heavy side
-            denom = bid_vol + ask_vol
-            if denom > 0:
-                imbalance = (bid_vol - ask_vol) / denom
-                fair_value += imbalance * 0.5
+        def sell(price, volume):
+            nonlocal sell_cap
+            vol = min(abs(int(volume)), sell_cap)
+            if vol > 0:
+                orders.append(Order("ASH_COATED_OSMIUM", int(price), -vol))
+                sell_cap -= vol
 
-            for price in sorted(order_depth.sell_orders.keys()):
-                max_buy = self.TM_POSITION_LIMIT - pos
-                if max_buy <= 0:
-                    break
-                if price < fair_value or (price <= fair_value and pos < 0):
-                    available = -order_depth.sell_orders[price]
-                    qty = min(available, max_buy)
-                    if qty > 0:
-                        orders.append(Order("TOMATOES", price, qty))
-                        pos += qty
+        # --- TAKING ---
+        for ask_p, ask_v in asks.items():
+            if ask_p <= wall_mid - 1:
+                buy(ask_p, ask_v)                        # clearly cheap
+            elif ask_p <= wall_mid and pos < 0:
+                buy(ask_p, min(ask_v, abs(pos)))         # reduce short at mid
 
-            for price in sorted(order_depth.buy_orders.keys(), reverse=True):
-                max_sell = self.TM_POSITION_LIMIT + pos
-                if max_sell <= 0:
-                    break
-                if price > fair_value or (price >= fair_value and pos > 0):
-                    available = order_depth.buy_orders[price]
-                    qty = min(available, max_sell)
-                    if qty > 0:
-                        orders.append(Order("TOMATOES", price, -qty))
-                        pos -= qty
+        for bid_p, bid_v in bids.items():
+            if bid_p >= wall_mid + 1:
+                sell(bid_p, bid_v)                       # clearly expensive
+            elif bid_p >= wall_mid and pos > 0:
+                sell(bid_p, min(bid_v, pos))             # reduce long at mid
 
-            market_spread = best_ask - best_bid
-            if market_spread < self.TM_TIGHT_SPREAD_THRESHOLD:
-                edge = self.TM_TIGHT_EDGE
-                size_mult = 0.5
-            else:
-                edge = self.TM_BASE_EDGE
-                size_mult = 1.0
+        # --- MAKING: queue-improve around wall_mid ---
+        # Bid: start at bid_wall + 1, then overbid the best bid below wall_mid
+        bid_price = bid_wall + 1
+        for bp, bv in bids.items():
+            if bp >= wall_mid:
+                continue
+            bid_price = max(bid_price, (bp + 1) if bv > 1 else bp)
+            break
 
-            skew = round(pos * self.TM_SKEW)
-            bid_price = math.floor(fair_value) - edge - skew
-            ask_price = math.ceil(fair_value) + edge - skew
+        # Ask: start at ask_wall - 1, then underbid the best ask above wall_mid
+        ask_price = ask_wall - 1
+        for ap, av in asks.items():
+            if ap <= wall_mid:
+                continue
+            ask_price = min(ask_price, (ap - 1) if av > 1 else ap)
+            break
 
-            bid_price = min(bid_price, best_ask - 1)
-            ask_price = max(ask_price, best_bid + 1)
-            if bid_price >= ask_price:
-                bid_price = ask_price - 1
+        # Safety: prevent bid >= ask
+        if bid_price >= ask_price:
+            bid_price  = int(wall_mid) - 1
+            ask_price  = int(wall_mid) + 1
 
-            max_buy = self.TM_POSITION_LIMIT - pos
-            max_sell = self.TM_POSITION_LIMIT + pos
-            passive_buy_qty = int(max_buy * size_mult)
-            passive_sell_qty = int(max_sell * size_mult)
+        buy(bid_price, buy_cap)
+        sell(ask_price, sell_cap)
 
-            if passive_buy_qty > 0:
-                orders.append(Order("TOMATOES", bid_price, passive_buy_qty))
-            if passive_sell_qty > 0:
-                orders.append(Order("TOMATOES", ask_price, -passive_sell_qty))
-
-            og_pos = state.position.get("TOMATOES", 0)
-            total_buy = sum(o.quantity for o in orders if o.quantity > 0)
-            total_sell = sum(-o.quantity for o in orders if o.quantity < 0)
-            
-            # Trim buys if would exceed +80
-            if og_pos + total_buy > 80:
-                excess = (og_pos + total_buy) - 80
-                for i in range(len(orders) - 1, -1, -1):
-                    if orders[i].quantity > 0 and orders[i].price < math.floor(fair_value):
-                        trim = min(orders[i].quantity, excess)
-                        orders[i].quantity -= trim
-                        excess -= trim
-                        if excess <= 0:
-                            break
-            
-            # Trim sells if would exceed -80
-            if og_pos - total_sell < -80:
-                excess = -((og_pos - total_sell) - 80)
-                for i in range(len(orders) - 1, -1, -1):
-                    if orders[i].quantity < 0 and orders[i].price > math.ceil(fair_value):
-                        trim = min(-orders[i].quantity, excess)
-                        orders[i].quantity += trim
-                        excess -= trim
-                        if excess <= 0:
-                            break
-            
-            orders = [o for o in orders if o.quantity != 0]
-            result["TOMATOES"] = orders
-
-        print(
-            f"POS {state.timestamp} "
-            + " ".join(f"{p}:{state.position.get(p, 0)}" for p in state.order_depths)
-        )
-
-        traderData = ""
-        conversions = 0
-        return result, conversions, traderData
+        return [o for o in orders if o.quantity != 0]
