@@ -45,3 +45,29 @@ prosperity4btest trader.py 0 --vis
 prosperity4btest trader.py 0--2 0--1 --merge-pnl
 prosperity4btest trader.py 1 --print
 ```
+
+### Round 1 — required flags
+
+The backtester defaults to 50-unit limits. Round 1 allows 80. Without `--limit` flags all 80-unit orders are rejected and PnL = 0. **Always use:**
+
+```bash
+# Standard Round 1 backtest (all 3 days, merged PnL)
+prosperity4btest trader.py 1 --data data --merge-pnl --no-out \
+  --limit ASH_COATED_OSMIUM:80 --limit INTARIAN_PEPPER_ROOT:80
+
+# Single day (e.g. day 0)
+prosperity4btest trader.py 1-0 --data data --no-out \
+  --limit ASH_COATED_OSMIUM:80 --limit INTARIAN_PEPPER_ROOT:80
+
+# With visualizer
+prosperity4btest trader.py 1 --data data --merge-pnl \
+  --limit ASH_COATED_OSMIUM:80 --limit INTARIAN_PEPPER_ROOT:80 --vis
+```
+
+### Round 1 baselines (local, 10k iterations per day)
+
+| Trader version | ACO/day avg | PEP/day avg | Total 3-day | Notes |
+|---|---|---|---|---|
+| Phase 1.1 (limits→80) | ~17,357 | ~65,187 | 247,631 | PEP_LIMIT fixed, limits correct |
+| Phase 1.2 (target=25, width=1) | ~17,357 | ~76,093 | 254,179 | Grid-search optimized target/width |
+| Phase 2 attempt (EWMA+A-S) | ~17,357 | ~43,040 | 181,192 | **Reverted** — worse than baseline |
