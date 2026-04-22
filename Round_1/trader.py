@@ -5,20 +5,20 @@ import json
 
 POSITION_LIMIT = 80
 
-PEP_TARGET_POSITION  = 75
-PEP_TARGET_WIDTH     = 5
-PEP_BID_NORMAL       = 1
-PEP_ASK_NORMAL       = 5
-PEP_BID_AGGRESSIVE   = 0
-PEP_ASK_AGGRESSIVE   = 6
-PEP_BID_DEFENSIVE    = 3
-PEP_ASK_DEFENSIVE    = 4
+PEP_TARGET_POSITION = 75
+PEP_TARGET_WIDTH = 5
+PEP_BID_NORMAL = 1
+PEP_ASK_NORMAL = 5
+PEP_BID_AGGRESSIVE = 0
+PEP_ASK_AGGRESSIVE = 6
+PEP_BID_DEFENSIVE = 3
+PEP_ASK_DEFENSIVE = 4
 PEP_TAKING_THRESHOLD = 15
-PEP_LIMIT            = 80
-PEP_NEVER_SELL       = True
+PEP_LIMIT = 80
+PEP_NEVER_SELL = True
 PEP_SAFETY_NEG_STREAK = 25
-PEP_ENTRY_TAKE_EDGE  = 8
-PEP_ENTRY_TAKE_CLIP  = 8
+PEP_ENTRY_TAKE_EDGE = 8
+PEP_ENTRY_TAKE_CLIP = 8
 
 
 class Logger:
@@ -132,7 +132,6 @@ class Trader:
         if not od.buy_orders or not od.sell_orders:
             return orders
 
-        # Sorted book: bids descending, asks ascending, all volumes positive
         bids = {p: abs(v) for p, v in sorted(od.buy_orders.items(), reverse=True)}
         asks = {p: abs(v) for p, v in sorted(od.sell_orders.items())}
 
@@ -140,7 +139,7 @@ class Trader:
         ask_wall = max(asks)
         wall_mid = (bid_wall + ask_wall) / 2
 
-        buy_cap  = POSITION_LIMIT - pos
+        buy_cap = POSITION_LIMIT - pos
         sell_cap = POSITION_LIMIT + pos
 
         def buy(price, volume):
@@ -169,7 +168,6 @@ class Trader:
             elif bid_p >= wall_mid and pos > 0:
                 sell(bid_p, min(bid_v, pos))
 
-        # Queue-improve: start at wall extremes, then step inside best resting order
         bid_price = bid_wall + 1
         for bp, bv in bids.items():
             if bp >= wall_mid:
@@ -206,12 +204,12 @@ class Trader:
         bid_wall = min(od.buy_orders)
         ask_wall = max(od.sell_orders)
         fair = (bid_wall + ask_wall) / 2
-        mid  = (best_bid + best_ask) / 2
+        mid = (best_bid + best_ask) / 2
 
-        last_mid   = td.get("pep_last_mid")
+        last_mid = td.get("pep_last_mid")
         neg_streak = int(td.get("pep_neg_streak", 0))
         neg_streak = neg_streak + 1 if isinstance(last_mid, (int, float)) and mid < last_mid else 0
-        td["pep_last_mid"]   = mid
+        td["pep_last_mid"] = mid
         td["pep_neg_streak"] = neg_streak
         safety_off = neg_streak >= PEP_SAFETY_NEG_STREAK
 
@@ -219,7 +217,7 @@ class Trader:
             buy_cap = PEP_LIMIT - pos
             if buy_cap <= 0:
                 td["pep_fair"] = fair
-                td["pep_pos"]  = pos
+                td["pep_pos"] = pos
                 return orders, td
 
             if best_ask <= fair + PEP_ENTRY_TAKE_EDGE:
@@ -232,11 +230,10 @@ class Trader:
                 orders.append(Order("INTARIAN_PEPPER_ROOT", round(fair - PEP_BID_AGGRESSIVE), buy_cap))
 
             td["pep_fair"] = fair
-            td["pep_pos"]  = pos
+            td["pep_pos"] = pos
             return [o for o in orders if o.quantity != 0], td
 
-        # Safety fallback: standard asymmetric MM toward target position
-        target_low  = PEP_TARGET_POSITION - PEP_TARGET_WIDTH
+        target_low = PEP_TARGET_POSITION - PEP_TARGET_WIDTH
         target_high = PEP_TARGET_POSITION + PEP_TARGET_WIDTH
 
         if pos < target_low:
@@ -252,7 +249,7 @@ class Trader:
             if take_qty > 0:
                 orders.append(Order("INTARIAN_PEPPER_ROOT", best_ask, take_qty))
 
-        buy_cap  = PEP_LIMIT - pos
+        buy_cap = PEP_LIMIT - pos
         sell_cap = PEP_LIMIT + pos
 
         if mode == "accumulate":
@@ -274,9 +271,9 @@ class Trader:
         if sell_cap > 0:
             orders.append(Order("INTARIAN_PEPPER_ROOT", ask_price, -sell_cap))
 
-        td["pep_mode"]      = mode
-        td["pep_fair"]      = fair
-        td["pep_pos"]       = pos
+        td["pep_mode"] = mode
+        td["pep_fair"] = fair
+        td["pep_pos"] = pos
         td["pep_safety_off"] = safety_off
 
         return [o for o in orders if o.quantity != 0], td
