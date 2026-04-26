@@ -1,0 +1,1207 @@
+import json
+import math
+from typing import Any
+from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
+
+
+# --- PROSPERITY LOGGER BOILERPLATE ---
+class Logger:
+    def __init__(self) -> None:
+        self.logs = ""
+        self.max_log_length = 3750
+
+    def print(self, *objects: Any, sep: str = " ", end: str = "\n") -> None:
+        self.logs += sep.join(map(str, objects)) + end
+
+    def flush(self, state: TradingState, orders: dict[Symbol, list[Order]], conversions: int, trader_data: str) -> None:
+        base_length = len(
+            self.to_json(
+                [
+                    self.compress_state(state, ""),
+                    self.compress_orders(orders),
+                    conversions,
+                    "",
+                    "",
+                    "",
+                ]
+            )
+        )
+
+        max_item_length = (self.max_log_length - base_length) // 3
+
+        print(
+            self.to_json(
+                [
+                    self.compress_state(state, self.truncate(state.traderData, max_item_length)),
+                    self.compress_orders(orders),
+                    conversions,
+                    self.truncate(trader_data, max_item_length),
+                    self.truncate(self.logs, max_item_length),
+                ]
+            )
+        )
+
+        self.logs = ""
+
+    def compress_state(self, state: TradingState, trader_data: str) -> list[Any]:
+        return [
+            state.timestamp,
+            trader_data,
+            self.compress_listings(state.listings),
+            self.compress_order_depths(state.order_depths),
+            self.compress_trades(state.own_trades),
+            self.compress_trades(state.market_trades),
+            state.position,
+            self.compress_observations(state.observations),
+        ]
+
+    def compress_listings(self, listings: dict[Symbol, Listing]) -> list[list[Any]]:
+        compressed = []
+        for listing in listings.values():
+            compressed.append([listing.symbol, listing.product, listing.denomination])
+        return compressed
+
+    def compress_order_depths(self, order_depths: dict[Symbol, OrderDepth]) -> dict[Symbol, list[Any]]:
+        compressed = {}
+        for symbol, order_depth in order_depths.items():
+            compressed[symbol] = [order_depth.buy_orders, order_depth.sell_orders]
+        return compressed
+
+    def compress_trades(self, trades: dict[Symbol, list[Trade]]) -> list[list[Any]]:
+        compressed = []
+        for arr in trades.values():
+            for trade in arr:
+                compressed.append(
+                    [
+                        trade.symbol,
+                        trade.price,
+                        trade.quantity,
+                        trade.buyer,
+                        trade.seller,
+                        trade.timestamp,
+                    ]
+                )
+        return compressed
+
+    def compress_observations(self, observations: Observation) -> list[Any]:
+        conversion_observations = {}
+        for product, observation in observations.conversionObservations.items():
+            conversion_observations[product] = [
+                observation.bidPrice,
+                observation.askPrice,
+                observation.transportFees,
+                observation.exportTariff,
+                observation.importTariff,
+                observation.sugarPrice,
+                observation.sunlightIndex,
+            ]
+        return [observations.plainValueObservations, conversion_observations]
+
+    def compress_orders(self, orders: dict[Symbol, list[Order]]) -> list[list[Any]]:
+        compressed = []
+        for arr in orders.values():
+            for order in arr:
+                compressed.append([order.symbol, order.price, order.quantity])
+        return compressed
+
+    def to_json(self, value: Any) -> str:
+        return json.dumps(value, cls=ProsperityEncoder, separators=(",", ":"))
+
+    def truncate(self, value: str, max_length: int) -> str:
+        lo, hi = 0, min(len(value), max_length)
+        out = ""
+
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = value[:mid]
+
+            if len(candidate) < len(value):
+                candidate += "..."
+
+            encoded_candidate = json.dumps(candidate)
+
+            if len(encoded_candidate) <= max_length:
+                out = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        return out
+
+
+logger = Logger()
+# --- END LOGGER BOILERPLATE ---
+
+
+class Trader:
+    """
+    COMBINED: 473705 Hydro + 475012 Vouchers/VFE.
+
+    Mean-reversion voucher strategy v1.1: same core signal, scaled sizing.
+
+    Core idea:
+    - VELVETFRUIT_EXTRACT is treated as a mean-reverting underlying.
+    - If VFE is far above its slow live mean, short liquid call vouchers.
+    - If VFE is far below its slow live mean, buy liquid call vouchers.
+    - We start only with VEV_5000, VEV_5100, VEV_5200.
+
+    This deliberately does NOT use day-specific fitted constants, fixed residual tables,
+    or a Black-Scholes fair-value curve fitted to the public files. The only fitted thing
+    is a live EWMA mean/z-score built from the current run.
+    """
+
+    POSITION_LIMITS = {
+        "VELVETFRUIT_EXTRACT": 200,
+        "HYDROGEL_PACK": 200,
+        "VEV_4000": 300,
+        "VEV_4500": 300,
+        "VEV_5000": 300,
+        "VEV_5100": 300,
+        "VEV_5200": 300,
+        "VEV_5300": 300,
+        "VEV_5400": 300,
+        "VEV_5500": 300,
+        "VEV_6000": 300,
+        "VEV_6500": 300,
+    }
+
+    # v2 did worse because it filtered away the actual edge. This version keeps the old
+    # signal unchanged and only scales the products that already made money.
+    # 5200 is the cleanest/tightest of the 5k-5.2k set, so it gets the most size.
+    EFFECTIVE_LIMITS = {
+        "HYDROGEL_PACK": 200,
+        "VEV_4000": 300,
+        "VEV_4500": 300,
+        "VEV_5000": 300,
+        "VEV_5100": 300,
+        "VEV_5200": 300,
+        "VEV_5300": 300,  # optional extension; disabled by default below
+        "VEV_5400": 300,
+        "VEV_5500": 300,
+        "VELVETFRUIT_EXTRACT": 200,
+    }
+
+    CORE_PRODUCTS = ["VEV_5000", "VEV_5100", "VEV_5200"]
+    EXTRA_PRODUCTS = ["VEV_5300"]
+
+    # Keep this False for the first test. If this v1.1 core beats v1, flip it True.
+    # 5300 has lower delta but much tighter spread, so it can help when the MR signal is strong.
+    ENABLE_5300 = True
+
+    # Optional deep-ITM extensions. These use the exact same target/entry/exit logic as the existing products.
+    # Default OFF so the current best strategy is unchanged unless you explicitly enable them.
+    ENABLE_4000 = False
+    ENABLE_4500 = False
+
+    # Optional extensions. These use the exact same target/entry/exit logic as the existing products.
+    ENABLE_5400 = True
+    ENABLE_5500 = False
+
+    # Optional direct underlying mean-reversion trade. Uses the exact same signal,
+    # target-position, spread guard, and trade_to_target logic as the vouchers.
+    ENABLE_VFE = True
+
+    # Target absolute position when the underlying is in a mean-reversion regime.
+    # This is the main improvement over the old +52k version: same signal, more size.
+    TARGET_POS = {
+        "VEV_4000": 270,
+        "VEV_4500": 270,
+        "VEV_5000": 300,
+        "VEV_5100": 300,
+        "VEV_5200": 300,
+        "VEV_5300": 300,
+        "VEV_5400": 300,
+        "VEV_5500": 270,
+        "VELVETFRUIT_EXTRACT": 180,
+    }
+
+    # Median public spreads were roughly 6, 4, 3 for 5000/5100/5200.
+    # These are not alpha constants; they are liquidity guards.
+    MAX_ENTRY_SPREAD = {
+        "VEV_4000": 25,
+        "VEV_4500": 18,
+        "VEV_5000": 7,
+        "VEV_5100": 5,
+        "VEV_5200": 4,
+        "VEV_5300": 3,
+        "VEV_5400": 3,
+        "VEV_5500": 3,
+        "VELVETFRUIT_EXTRACT": 3,
+    }
+
+    # Risk refinement from the website log:
+    # Use normal spread guards when ADDING exposure, but allow wider exits so stale
+    # positions do not get trapped when the signal turns off. VFE was especially
+    # getting stuck because its spread often sits at 5-6 while entry max was 3.
+    MAX_EXIT_SPREAD = {
+        "VEV_4000": 28,
+        "VEV_4500": 21,
+        "VEV_5000": 8,
+        "VEV_5100": 6,
+        "VEV_5200": 5,
+        "VEV_5300": 4,
+        "VEV_5400": 4,
+        "VEV_5500": 4,
+        "VELVETFRUIT_EXTRACT": 6,
+    }
+
+    # Maximum aggressive size per timestamp. The actual filled size is also capped
+    # by displayed top-of-book volume. Slightly larger than v1 so positions reach
+    # target faster when the deviation is real.
+    MAX_TAKE = {
+        "VEV_4000": 18,
+        "VEV_4500": 22,
+        "VEV_5000": 24,
+        "VEV_5100": 32,
+        "VEV_5200": 36,
+        "VEV_5300": 28,
+        "VEV_5400": 28,
+        "VEV_5500": 28,
+        "VELVETFRUIT_EXTRACT": 40,
+    }
+
+    # Exit-only take sizes. Entries still use MAX_TAKE exactly as before.
+    # This only lets the strategy flatten faster once target exposure is being reduced.
+    MAX_EXIT_TAKE = {
+    "VEV_4000": 24,
+    "VEV_4500": 28,
+    "VEV_5000": 36,
+    "VEV_5100": 48,
+    "VEV_5200": 56,
+    "VEV_5300": 44,
+    "VEV_5400": 40,
+    "VEV_5500": 40,
+    "VELVETFRUIT_EXTRACT": 45,
+    }
+
+    # Slow underlying mean. One Prosperity day has about 10,000 price rows, so this
+    # is a half-day-ish memory, not a tiny optimized window.
+    EMA_SPAN = 5000.0
+    EMA_ALPHA = 2.0 / (EMA_SPAN + 1.0)
+
+    # Enter only on fairly extreme deviations. Exit when the deviation has mostly mean-reverted.
+    ENTRY_Z = 1.5
+    EXIT_Z = 0.20
+
+    # If z is only barely past entry, require that top-of-book VFE imbalance is not
+    # fighting the reversal. If z is very extreme, take the mean-reversion trade anyway.
+    STRONG_Z = 2.7
+    OBI_CONFIRM_TOL = 0.10
+
+    # Let the livemean/variance form before trading. This avoids trading noise right
+    # at timestamp 0 on a hidden day.
+    WARMUP_TICKS = 30
+
+    # Risk refinement: after a completed mean-reversion cycle, do not immediately
+    # re-enter on another marginal z=1.5 signal. The website drawdown happened when
+    # the strategy exited the first long, then re-entered before the down-move had
+    # finished. During this cooldown, only a genuinely extreme deviation can restart.
+    REENTRY_COOLDOWN_TICKS = 80
+    REENTRY_Z_DURING_COOLDOWN = 2.30
+
+
+
+    # --- HYDROGEL: OSMIUM-STYLE DEPTH/KALMAN MARKET MAKER ---
+    # Round 1 ASH_COATED_OSMIUM logic ported to HYDROGEL_PACK.
+    # This version removes rebound-stop exits and instead adds soft protection:
+    # - block NEW longs during fast drops
+    # - block NEW shorts during fast rips
+    # - stop adding passive bids/asks once inventory is already heavy
+    #
+    # No timestamp-based flattening is used. Prosperity PnL marks/liquidates ending inventory.
+    ENABLE_HYDROGEL = True
+    HYDRO_PRODUCT = "HYDROGEL_PACK"
+    HYDRO_LIMIT = 200
+
+    # Ablation toggles. Use these to see whether the edge is taking, passive quoting, or both.
+    HYDRO_ENABLE_TAKE = True
+    HYDRO_ENABLE_PASSIVE = True
+
+    # The Osmium code anchored fair toward 10000. Keep as a parameter for quick tests.
+    HYDRO_ANCHOR = 10000.0
+
+    # --- HYDRO BOOK-SHAPE ALPHA EXPERIMENTS ---
+    # Master toggles so you can instantly ablate each module without touching logic.
+    # gap_skew = (bid1 - bid2) - (ask2 - ask1)
+    # Negative gap_skew -> bullish; positive gap_skew -> bearish.
+    ENABLE_HYDRO_GAP_ALPHA = True
+    HYDRO_GAP_THRESHOLD = 1
+    HYDRO_GAP_ALPHA_STRENGTH = 2.0
+
+    # Also skew passive quote sizes away from the toxic side of the book.
+    ENABLE_HYDRO_GAP_SIZE_SKEW = False
+    HYDRO_GAP_FAVORED_SIZE_SCALE = 1.50
+    HYDRO_GAP_TOXIC_SIZE_SCALE = 0.40
+
+    # Original anchor behavior was equivalent to 0.25. Lower weight lets Hydro
+    # follow live book/fair movement more instead of fading hard to 10000.
+    ENABLE_HYDRO_DYNAMIC_ANCHOR_WEIGHT = False
+    HYDRO_ANCHOR_WEIGHT = 0.10
+
+    # Soft crash/rip protection. This does NOT flatten winners. It only prevents
+    # adding exposure in the dangerous direction.
+    HYDRO_USE_TREND_BLOCK = True
+    HYDRO_TREND_WINDOW = 50
+    HYDRO_CRASH_BLOCK_LONGS = 25.0   # if mid dropped this much over 50 ticks, don't add longs
+    HYDRO_RIP_BLOCK_SHORTS = 25.0    # if mid rose this much over 50 ticks, don't add shorts
+
+    # Inventory-side protection for passive quotes. These only stop ADDING more
+    # inventory on the dangerous side; they still allow quotes/orders that reduce inventory.
+    HYDRO_DISABLE_BID_ABOVE_POS = 180     # if already long > 80, stop passive bids/new buy-taking
+    HYDRO_DISABLE_ASK_BELOW_POS = -180   # if already short < -120, stop passive asks/new sell-taking
+
+    # --- Hybrid layer: use pasted/v12 logic ONLY for deep-ITM VEV_4000/VEV_4500. ---
+    # Everything else stays exactly as this numbered strategy.
+    ENABLE_PASTED_DEEP_ITM = True
+    PASTED_DEEP_ITM_STRIKES = ("VEV_4000", "VEV_4500")
+    PASTED_DEEP_ITM_BIAS_ALPHA = 0.05
+    PASTED_DEEP_ITM_GLIDE = 8
+    PASTED_VEV_MAX_POS_FRAC = 1.0
+    PASTED_VEV_MAKE_SIZE = 40
+    PASTED_VEV_TAKE_EDGE = 0
+    PASTED_VEV_MAKE_EDGE = 0
+    PASTED_FLUSH_RATE = 5
+
+    # Minimal copy of the pasted/v12 VE-long regime, used only to decide whether
+    # 4000/4500 should glide max-long instead of intrinsic fair-value MM.
+    PASTED_V4_VE_EMA_ALPHA = 0.001
+    PASTED_V4_VE_SEED_VAR = 16.0
+    PASTED_V4_LONG_ENTER_Z = -3.0
+    PASTED_V4_LONG_EXIT_Z = -0.5
+
+
+    def active_products(self) -> list[str]:
+        products = list(self.CORE_PRODUCTS)
+
+        if self.ENABLE_4000:
+            products.append("VEV_4000")
+
+        if self.ENABLE_4500:
+            products.append("VEV_4500")
+
+        if self.ENABLE_5300:
+            products += self.EXTRA_PRODUCTS
+
+        if self.ENABLE_5400:
+            products.append("VEV_5400")
+
+        if self.ENABLE_5500:
+            products.append("VEV_5500")
+
+        if self.ENABLE_VFE:
+            products.append("VELVETFRUIT_EXTRACT")
+
+        return products
+
+    def effective_limit(self, product: str) -> int:
+        return self.EFFECTIVE_LIMITS.get(product, self.POSITION_LIMITS.get(product, 0))
+
+    def position(self, state: TradingState, product: str) -> int:
+        return state.position.get(product, 0)
+
+    def buy_capacity(self, state: TradingState, product: str) -> int:
+        return self.effective_limit(product) - self.position(state, product)
+
+    def sell_capacity(self, state: TradingState, product: str) -> int:
+        return self.effective_limit(product) + self.position(state, product)
+
+    def best_bid_ask(self, depth: OrderDepth):
+        best_bid = max(depth.buy_orders.keys()) if depth.buy_orders else None
+        best_ask = min(depth.sell_orders.keys()) if depth.sell_orders else None
+        return best_bid, best_ask
+
+    def mid(self, depth: OrderDepth):
+        bid, ask = self.best_bid_ask(depth)
+        if bid is None or ask is None:
+            return None
+        return (bid + ask) / 2.0
+
+    def top_imbalance(self, depth: OrderDepth) -> float:
+        bid, ask = self.best_bid_ask(depth)
+        if bid is None or ask is None:
+            return 0.0
+
+        bid_vol = abs(depth.buy_orders.get(bid, 0))
+        ask_vol = abs(depth.sell_orders.get(ask, 0))
+
+        denom = bid_vol + ask_vol
+        if denom <= 0:
+            return 0.0
+
+        return (bid_vol - ask_vol) / denom
+
+    def load_data(self, trader_data: str) -> dict:
+        if not trader_data:
+            return {}
+        try:
+            return json.loads(trader_data)
+        except Exception:
+            return {}
+
+    def update_mr_signal(self, state: TradingState, data: dict, S: float) -> tuple[float, int, float, float]:
+        """
+        Returns: z-score, direction, ema, top-of-book imbalance.
+
+        direction:
+            +1 means buy/hold long vouchers, expecting VFE to revert upward.
+            -1 means sell/hold short vouchers, expecting VFE to revert downward.
+             0 means flatten/no position.
+        """
+        timestamp = int(state.timestamp)
+        last_timestamp = int(data.get("last_timestamp", -1))
+
+        # Public backtests concatenate days, but timestamp resets each day.
+        # Reset slow state on a new day so old day levels do not contaminate the current day.
+        if last_timestamp >= 0 and timestamp < last_timestamp:
+            data.clear()
+
+        ema = float(data.get("s_ema", S))
+        var = float(data.get("s_var", 100.0))
+        ticks = int(data.get("ticks", 0))
+        direction = int(data.get("mr_dir", 0))
+
+        dev = S - ema
+        std = math.sqrt(max(var, 4.0))
+        z = dev / std if std > 0 else 0.0
+
+        vfe_depth = state.order_depths.get("VELVETFRUIT_EXTRACT")
+        obi = self.top_imbalance(vfe_depth) if vfe_depth is not None else 0.0
+
+        last_exit_tick = int(data.get("last_exit_tick", -1_000_000_000))
+
+        if ticks < self.WARMUP_TICKS:
+            direction = 0
+        elif direction == 0:
+            entry_z = self.ENTRY_Z
+
+            # After an exit, require a stronger re-entry signal for a while.
+            # This keeps the same strategy, but avoids immediately getting max long/short
+            # again on a second leg of the same move.
+            if ticks - last_exit_tick < self.REENTRY_COOLDOWN_TICKS:
+                entry_z = max(entry_z, self.REENTRY_Z_DURING_COOLDOWN)
+
+            # S too high -> expected down move -> short calls.
+            short_confirmed = z >= entry_z and (z >= self.STRONG_Z or obi <= self.OBI_CONFIRM_TOL)
+
+            # S too low -> expected up move -> long calls.
+            long_confirmed = z <= -entry_z and (z <= -self.STRONG_Z or obi >= -self.OBI_CONFIRM_TOL)
+
+            if short_confirmed:
+                direction = -1
+            elif long_confirmed:
+                direction = 1
+
+        elif direction > 0:
+            # Long calls because S was too low. Flatten once the negative deviation is gone.
+            if z >= -self.EXIT_Z:
+                direction = 0
+                data["last_exit_tick"] = ticks
+
+        elif direction < 0:
+            # Short calls because S was too high. Flatten once the positive deviation is gone.
+            if z <= self.EXIT_Z:
+                direction = 0
+                data["last_exit_tick"] = ticks
+
+        # Update model after using previous mean for the signal.
+        ema = ema + self.EMA_ALPHA * dev
+        var = (1.0 - self.EMA_ALPHA) * var + self.EMA_ALPHA * dev * dev
+
+        data["s_ema"] = ema
+        data["s_var"] = var
+        data["ticks"] = ticks + 1
+        data["mr_dir"] = direction
+        data["last_timestamp"] = timestamp
+
+        return z, direction, ema, obi
+
+    def target_position(self, product: str, direction: int, z: float) -> int:
+        if direction == 0:
+            return 0
+
+        base = self.TARGET_POS[product]
+
+        # Add modest size only on truly extreme deviations. This is not curve-fitting;
+        # it avoids constantly resizing on every small z-score change.
+        if abs(z) >= 3.0:
+            base = int(base * 1.20)
+
+        limit = self.effective_limit(product)
+        base = min(base, limit)
+        return direction * base
+
+    def trade_to_target(self, state: TradingState, product: str, target: int, z: float) -> list[Order]:
+        orders: list[Order] = []
+
+        depth = state.order_depths.get(product)
+        if depth is None:
+            return orders
+
+        bid, ask = self.best_bid_ask(depth)
+        if bid is None or ask is None:
+            return orders
+
+        spread = ask - bid
+        pos = self.position(state, product)
+        diff = target - pos
+
+        if diff == 0:
+            return orders
+
+        # If adding exposure, demand normal liquidity. If reducing exposure, allow a
+        # separate wider exit spread so stale positions do not get trapped.
+        adding_exposure = abs(target) > abs(pos) or (target * pos < 0)
+        if adding_exposure:
+            max_allowed_spread = self.MAX_ENTRY_SPREAD[product]
+        else:
+            max_allowed_spread = self.MAX_EXIT_SPREAD.get(product, self.MAX_ENTRY_SPREAD[product] + 1)
+
+        if spread > max_allowed_spread:
+            return orders
+
+        if adding_exposure:
+            max_take = self.MAX_TAKE[product]
+        else:
+            max_take = self.MAX_EXIT_TAKE.get(product, self.MAX_TAKE[product])
+
+        if diff > 0:
+            # Need to buy vouchers.
+            buy_cap = self.buy_capacity(state, product)
+            available = -depth.sell_orders.get(ask, 0)
+            qty = min(diff, buy_cap, available, max_take)
+            if qty > 0:
+                orders.append(Order(product, int(ask), int(qty)))
+
+        elif diff < 0:
+            # Need to sell vouchers.
+            sell_cap = self.sell_capacity(state, product)
+            available = depth.buy_orders.get(bid, 0)
+            qty = min(-diff, sell_cap, available, max_take)
+            if qty > 0:
+                orders.append(Order(product, int(bid), -int(qty)))
+
+        if orders:
+            logger.print(
+                product,
+                "pos", pos,
+                "target", target,
+                "z", round(z, 3),
+                "bid", bid,
+                "ask", ask,
+                "spread", spread,
+            )
+
+        return orders
+
+
+    def get_hydrogel_orders(self, product: str, order_depth: OrderDepth, current_pos: int, state_data: dict) -> list[Order]:
+        """
+        ASH_COATED_OSMIUM strategy ported to HYDROGEL_PACK.
+
+        This version removes the rebound-stop exit because that killed the edge.
+        Instead, it adds "do not add the wrong side" protection:
+        - during a 50-tick crash, do not add new longs
+        - during a 50-tick rip, do not add new shorts
+        - if already heavily long, do not add more passive bids / buy-taking
+        - if already heavily short, do not add more passive asks / sell-taking
+
+        It still allows inventory-reducing trades. Example: if short during a crash,
+        buys are allowed only up to flat, not through flat into a new long.
+        """
+        orders: list[Order] = []
+        effective_limit = self.HYDRO_LIMIT
+
+        sorted_asks = sorted(order_depth.sell_orders.items())
+        sorted_bids = sorted(order_depth.buy_orders.items(), reverse=True)
+
+        last_fair = state_data.get("hydro_last_fair", state_data.get("hydro_kalman_x", self.HYDRO_ANCHOR))
+
+        if not sorted_asks and not sorted_bids:
+            return orders
+
+        if not sorted_asks:
+            best_bid = sorted_bids[0][0]
+            buy_price = best_bid + 1
+            edge = last_fair - buy_price
+            if self.HYDRO_ENABLE_PASSIVE and edge >= 2 and current_pos < self.HYDRO_DISABLE_BID_ABOVE_POS:
+                buy_qty = min(8, effective_limit - current_pos)
+                if buy_qty > 0:
+                    orders.append(Order(product, buy_price, buy_qty))
+            if self.HYDRO_ENABLE_TAKE and current_pos > 0:
+                unwind_qty = min(8, current_pos)
+                if unwind_qty > 0:
+                    orders.append(Order(product, int(math.ceil(last_fair + 1)), -unwind_qty))
+            return orders
+
+        if not sorted_bids:
+            best_ask = sorted_asks[0][0]
+            sell_price = best_ask - 1
+            edge = sell_price - last_fair
+            if self.HYDRO_ENABLE_PASSIVE and edge >= 2 and current_pos > self.HYDRO_DISABLE_ASK_BELOW_POS:
+                sell_qty = min(8, effective_limit + current_pos)
+                if sell_qty > 0:
+                    orders.append(Order(product, sell_price, -sell_qty))
+            if self.HYDRO_ENABLE_TAKE and current_pos < 0:
+                unwind_qty = min(8, -current_pos)
+                if unwind_qty > 0:
+                    orders.append(Order(product, int(math.floor(last_fair - 1)), unwind_qty))
+            return orders
+
+        def compute_vwap(levels, depth=3):
+            cum_vol = 0
+            cum_px_vol = 0
+            for i, (px, vol) in enumerate(levels):
+                if i >= depth:
+                    break
+                vol_abs = abs(vol)
+                cum_vol += vol_abs
+                cum_px_vol += px * vol_abs
+            return cum_px_vol / cum_vol if cum_vol > 0 else None
+
+        bid_vwap = compute_vwap(sorted_bids)
+        ask_vwap = compute_vwap(sorted_asks)
+        best_bid, best_bid_qty = sorted_bids[0]
+        best_ask, best_ask_qty = sorted_asks[0]
+        mid_price = (best_bid + best_ask) / 2.0
+
+        # Ladder gap-skew alpha: negative gap is bullish, positive gap is bearish.
+        gap_skew = 0
+        gap_alpha = 0.0
+        if self.ENABLE_HYDRO_GAP_ALPHA and len(sorted_bids) >= 2 and len(sorted_asks) >= 2:
+            bid_gap = sorted_bids[0][0] - sorted_bids[1][0]
+            ask_gap = sorted_asks[1][0] - sorted_asks[0][0]
+            gap_skew = bid_gap - ask_gap
+            if gap_skew <= -self.HYDRO_GAP_THRESHOLD:
+                gap_alpha = self.HYDRO_GAP_ALPHA_STRENGTH
+            elif gap_skew >= self.HYDRO_GAP_THRESHOLD:
+                gap_alpha = -self.HYDRO_GAP_ALPHA_STRENGTH
+
+        if bid_vwap and ask_vwap:
+            total_bid_vol = sum(abs(q) for _, q in sorted_bids[:3])
+            total_ask_vol = sum(abs(q) for _, q in sorted_asks[:3])
+            if total_bid_vol + total_ask_vol > 0:
+                observation = (bid_vwap * total_ask_vol + ask_vwap * total_bid_vol) / (total_bid_vol + total_ask_vol)
+            else:
+                observation = mid_price
+        else:
+            observation = mid_price
+
+        # 50-tick price-difference safety switch.
+        mid_history = state_data.get("hydro_mid_history", [])
+        if not isinstance(mid_history, list):
+            mid_history = []
+        mid_history.append(mid_price)
+        max_hist = max(self.HYDRO_TREND_WINDOW + 2, 60)
+        if len(mid_history) > max_hist:
+            mid_history = mid_history[-max_hist:]
+        state_data["hydro_mid_history"] = mid_history
+
+        trend_50 = 0.0
+        if len(mid_history) > self.HYDRO_TREND_WINDOW:
+            trend_50 = mid_price - float(mid_history[-1 - self.HYDRO_TREND_WINDOW])
+
+        # Block only NEW exposure in the dangerous direction. Reducing exposure remains allowed.
+        block_new_longs = False
+        block_new_shorts = False
+        if self.HYDRO_USE_TREND_BLOCK:
+            if trend_50 <= -self.HYDRO_CRASH_BLOCK_LONGS:
+                block_new_longs = True
+            if trend_50 >= self.HYDRO_RIP_BLOCK_SHORTS:
+                block_new_shorts = True
+
+        if current_pos >= self.HYDRO_DISABLE_BID_ABOVE_POS:
+            block_new_longs = True
+        if current_pos <= self.HYDRO_DISABLE_ASK_BELOW_POS:
+            block_new_shorts = True
+
+        # Kalman filter update.
+        x_est = state_data.get("hydro_kalman_x", observation)
+        P_est = state_data.get("hydro_kalman_P", 1.0)
+
+        Q = 0.008
+        R = 0.3
+
+        x_pred = x_est
+        P_pred = P_est + Q
+
+        K = P_pred / (P_pred + R)
+        x_est = x_pred + K * (observation - x_pred)
+        P_est = (1 - K) * P_pred
+
+        state_data["hydro_kalman_x"] = x_est
+        state_data["hydro_kalman_P"] = P_est
+
+        kalman_fair = x_est
+        uncertainty = math.sqrt(P_est)
+
+        def compute_vwap_orig(levels, target_volume=50):
+            cum_vol = 0
+            cum_px_vol = 0
+            for px, vol in levels:
+                vol_abs = abs(vol)
+                take = min(vol_abs, target_volume - cum_vol)
+                if take <= 0:
+                    break
+                cum_vol += take
+                cum_px_vol += px * take
+            return cum_px_vol / cum_vol if cum_vol > 0 else None
+
+        bid_vwap_orig = compute_vwap_orig(sorted_bids)
+        ask_vwap_orig = compute_vwap_orig(sorted_asks)
+
+        if bid_vwap_orig and ask_vwap_orig:
+            depth_mid = (bid_vwap_orig + ask_vwap_orig) / 2.0
+        else:
+            depth_mid = mid_price
+
+        alpha_ema = 0.12
+        ema = state_data.get("hydro_ema")
+        if ema is None:
+            ema = depth_mid
+        else:
+            ema = alpha_ema * depth_mid + (1 - alpha_ema) * ema
+        state_data["hydro_ema"] = ema
+
+        fair_value_raw = 0.6 * kalman_fair + 0.4 * ema
+
+        total_bid_vol = abs(best_bid_qty)
+        total_ask_vol = abs(best_ask_qty)
+        imbalance = 0.0
+        if total_bid_vol + total_ask_vol > 0:
+            imbalance = (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol)
+
+        fair_value_raw += imbalance * 0.8 + gap_alpha
+
+        if self.ENABLE_HYDRO_DYNAMIC_ANCHOR_WEIGHT:
+            anchor_weight = max(0.0, min(1.0, self.HYDRO_ANCHOR_WEIGHT))
+        else:
+            anchor_weight = 0.25
+        fair_value_raw = (1.0 - anchor_weight) * fair_value_raw + anchor_weight * self.HYDRO_ANCHOR
+
+        pos_ratio = current_pos / float(effective_limit)
+        if pos_ratio < 0.6:
+            skew = pos_ratio * 2
+        else:
+            skew = pos_ratio * 5
+        fair_value = fair_value_raw - skew
+
+        state_data["hydro_last_fair"] = fair_value
+
+        def max_allowed_buy(desired_qty: int, pos: int) -> int:
+            # When longs are blocked, buys may cover shorts only; they cannot create/add longs.
+            if desired_qty <= 0:
+                return 0
+            cap = effective_limit - pos
+            if block_new_longs:
+                if pos < 0:
+                    cap = min(cap, -pos)
+                else:
+                    cap = 0
+            return max(0, min(desired_qty, cap))
+
+        def max_allowed_sell(desired_qty: int, pos: int) -> int:
+            # When shorts are blocked, sells may reduce longs only; they cannot create/add shorts.
+            if desired_qty <= 0:
+                return 0
+            cap = effective_limit + pos
+            if block_new_shorts:
+                if pos > 0:
+                    cap = min(cap, pos)
+                else:
+                    cap = 0
+            return max(0, min(desired_qty, cap))
+
+        # Aggressive taking.
+        if self.HYDRO_ENABLE_TAKE:
+            take_threshold = 0.5 + uncertainty * 1.0
+            buy_take_threshold = max(0.1, take_threshold - imbalance * 1.0)
+            sell_take_threshold = max(0.1, take_threshold + imbalance * 1.0)
+
+            for price, qty in sorted_asks:
+                if price < fair_value - buy_take_threshold:
+                    buy_amt = max_allowed_buy(-qty, current_pos)
+                    if buy_amt > 0:
+                        orders.append(Order(product, price, buy_amt))
+                        current_pos += buy_amt
+
+            for price, qty in sorted_bids:
+                if price > fair_value + sell_take_threshold:
+                    sell_amt = max_allowed_sell(qty, current_pos)
+                    if sell_amt > 0:
+                        orders.append(Order(product, price, -sell_amt))
+                        current_pos -= sell_amt
+
+        # Passive quoting with adaptive spread + add-side protection.
+        if self.HYDRO_ENABLE_PASSIVE:
+            base_half_spread = 0.5 + uncertainty * 1.0
+            ideal_bid = int(math.floor(fair_value - base_half_spread))
+            ideal_ask = int(math.ceil(fair_value + base_half_spread))
+
+            spread = best_ask - best_bid
+            if spread > 1:
+                my_bid_price = min(ideal_bid, best_bid + 1)
+                my_ask_price = max(ideal_ask, best_ask - 1)
+            else:
+                my_bid_price = ideal_bid
+                my_ask_price = ideal_ask
+
+            my_bid_price = min(my_bid_price, best_ask - 1)
+            my_ask_price = max(my_ask_price, best_bid + 1)
+
+            uncertainty_penalty = max(0.3, 1.0 - uncertainty * 0.5)
+            inv_penalty = max(0.3, 1.0 - abs(current_pos / float(effective_limit)))
+            qty = int(effective_limit * inv_penalty * uncertainty_penalty)
+            qty = max(3, qty)
+
+            bid_size_scale = max(0.3, 1.0 + imbalance * 2.0)
+            ask_size_scale = max(0.3, 1.0 - imbalance * 2.0)
+
+            # Gap-size skew suppresses the side more likely to get picked off.
+            if self.ENABLE_HYDRO_GAP_SIZE_SKEW and gap_alpha != 0.0:
+                favored = max(0.0, self.HYDRO_GAP_FAVORED_SIZE_SCALE)
+                toxic = max(0.0, self.HYDRO_GAP_TOXIC_SIZE_SCALE)
+                if gap_alpha > 0.0:
+                    bid_size_scale *= favored
+                    ask_size_scale *= toxic
+                else:
+                    ask_size_scale *= favored
+                    bid_size_scale *= toxic
+
+            bid_qty = max(1, int(qty * bid_size_scale))
+            ask_qty = max(1, int(qty * ask_size_scale))
+
+            safe_bid_qty = max_allowed_buy(bid_qty, current_pos)
+            if safe_bid_qty > 0:
+                orders.append(Order(product, my_bid_price, safe_bid_qty))
+
+            safe_ask_qty = max_allowed_sell(ask_qty, current_pos)
+            if safe_ask_qty > 0:
+                orders.append(Order(product, my_ask_price, -safe_ask_qty))
+
+        if orders:
+            logger.print(
+                product,
+                "OSM_PORT_SOFT_PROTECT",
+                "pos", current_pos,
+                "fair", round(fair_value, 2),
+                "raw", round(fair_value_raw, 2),
+                "unc", round(uncertainty, 3),
+                "imb", round(imbalance, 3),
+                "gap", gap_skew,
+                "gapA", round(gap_alpha, 2),
+                "trend50", round(trend_50, 2),
+                "blkL", block_new_longs,
+                "blkS", block_new_shorts,
+                "bid", best_bid,
+                "ask", best_ask,
+                "take", self.HYDRO_ENABLE_TAKE,
+                "passive", self.HYDRO_ENABLE_PASSIVE,
+            )
+
+        return orders
+
+    def _pasted_floor_int(self, x: float) -> int:
+        i = int(x)
+        return i - 1 if i > x else i
+
+    def _pasted_ceil_int(self, x: float) -> int:
+        i = int(x)
+        return i + 1 if i < x else i
+
+    def _pasted_book(self, depth: OrderDepth) -> dict:
+        bids = sorted(depth.buy_orders.items(), reverse=True)
+        asks = sorted((p, -v) for p, v in depth.sell_orders.items())
+        best_bid = bids[0][0] if bids else None
+        best_ask = asks[0][0] if asks else None
+        bid_wall = bids[-1][0] if bids else None
+        ask_wall = asks[-1][0] if asks else None
+        wall_mid = None
+        if bid_wall is not None and ask_wall is not None:
+            wall_mid = (bid_wall + ask_wall) / 2.0
+        mid = None
+        if best_bid is not None and best_ask is not None:
+            mid = (best_bid + best_ask) / 2.0
+        elif wall_mid is not None:
+            mid = wall_mid
+        return {
+            "bids": bids,
+            "asks": asks,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "bid_wall": bid_wall,
+            "ask_wall": ask_wall,
+            "wall_mid": wall_mid,
+            "mid": mid,
+        }
+
+    def _update_pasted_long_regime(self, data: dict, S: float) -> bool:
+        long_regime = float(data.get("pasted_v4_long_regime", 0.0)) > 0.5
+        ve_rm = data.get("pasted_v4_ve_rm")
+        ve_rv = float(data.get("pasted_v4_ve_rv", self.PASTED_V4_VE_SEED_VAR))
+        if ve_rm is None:
+            ve_rm = S
+        else:
+            ve_rm = float(ve_rm)
+
+        delta_ve = S - ve_rm
+        ve_rm += self.PASTED_V4_VE_EMA_ALPHA * delta_ve
+        ve_rv = (1.0 - self.PASTED_V4_VE_EMA_ALPHA) * (
+            ve_rv + self.PASTED_V4_VE_EMA_ALPHA * delta_ve * delta_ve
+        )
+        ve_std = max(ve_rv ** 0.5, 1.0)
+        z_ve = (S - ve_rm) / ve_std
+
+        if long_regime:
+            if z_ve >= self.PASTED_V4_LONG_EXIT_Z:
+                long_regime = False
+        else:
+            if z_ve <= self.PASTED_V4_LONG_ENTER_Z:
+                long_regime = True
+
+        data["pasted_v4_ve_rm"] = ve_rm
+        data["pasted_v4_ve_rv"] = ve_rv
+        data["pasted_v4_long_regime"] = 1.0 if long_regime else 0.0
+        data["pasted_v4_z_ve"] = z_ve
+        return long_regime
+
+    def _pasted_v4_glide(self, voucher: str, book: dict, pos: int, target_pos: int, rate: int) -> list[Order]:
+        orders: list[Order] = []
+        if not book["asks"] or not book["bids"]:
+            return orders
+        diff = target_pos - pos
+        if diff == 0:
+            return orders
+        if diff > 0:
+            remaining = min(diff, rate)
+            for price, vol in book["asks"]:
+                if remaining <= 0:
+                    break
+                q = min(vol, remaining)
+                if q > 0:
+                    orders.append(Order(voucher, int(price), int(q)))
+                    remaining -= q
+        else:
+            remaining = min(-diff, rate)
+            for price, vol in book["bids"]:
+                if remaining <= 0:
+                    break
+                q = min(vol, remaining)
+                if q > 0:
+                    orders.append(Order(voucher, int(price), -int(q)))
+                    remaining -= q
+        return orders
+
+    def _pasted_voucher_mm(
+        self,
+        voucher: str,
+        book: dict,
+        pos: int,
+        limit: int,
+        fair: float,
+        intrinsic: bool,
+        warming_up: bool,
+        flush_long: bool = False,
+        flush_short: bool = False,
+        skip_make: bool = False,
+        asym_make = None,
+    ) -> list[Order]:
+        orders: list[Order] = []
+        best_bid = book["best_bid"]
+        best_ask = book["best_ask"]
+        if best_bid is None or best_ask is None:
+            return orders
+
+        max_pos = max(1, int(limit * self.PASTED_VEV_MAX_POS_FRAC))
+        buy_cap = max(0, max_pos - pos)
+        sell_cap = max(0, max_pos + pos)
+        take_edge = self.PASTED_VEV_TAKE_EDGE if not intrinsic else 1
+        make_edge = self.PASTED_VEV_MAKE_EDGE if not intrinsic else 1
+
+        if flush_long and pos > 0 and book["bids"]:
+            bp, bv = book["bids"][0]
+            q = min(bv, sell_cap, pos, self.PASTED_FLUSH_RATE)
+            if q > 0:
+                orders.append(Order(voucher, int(bp), -int(q)))
+                sell_cap -= q
+                pos -= q
+        if flush_short and pos < 0 and book["asks"]:
+            ap, av = book["asks"][0]
+            q = min(av, buy_cap, -pos, self.PASTED_FLUSH_RATE)
+            if q > 0:
+                orders.append(Order(voucher, int(ap), int(q)))
+                buy_cap -= q
+                pos += q
+
+        allow_buy = not flush_long
+        allow_sell = not flush_short
+
+        if not warming_up:
+            for price, vol in book["asks"]:
+                if buy_cap <= 0:
+                    break
+                if price <= fair - take_edge and allow_buy:
+                    q = min(vol, buy_cap, self.PASTED_VEV_MAKE_SIZE)
+                    if q > 0:
+                        orders.append(Order(voucher, int(price), int(q)))
+                        buy_cap -= q
+                elif price <= fair and pos < 0:
+                    q = min(vol, -pos, buy_cap)
+                    if q > 0:
+                        orders.append(Order(voucher, int(price), int(q)))
+                        buy_cap -= q
+
+            for price, vol in book["bids"]:
+                if sell_cap <= 0:
+                    break
+                if price >= fair + take_edge and allow_sell:
+                    q = min(vol, sell_cap, self.PASTED_VEV_MAKE_SIZE)
+                    if q > 0:
+                        orders.append(Order(voucher, int(price), -int(q)))
+                        sell_cap -= q
+                elif price >= fair and pos > 0:
+                    q = min(vol, pos, sell_cap)
+                    if q > 0:
+                        orders.append(Order(voucher, int(price), -int(q)))
+                        sell_cap -= q
+
+        pos_frac = pos / max(1, max_pos)
+        skew = 1 if abs(pos_frac) > 0.5 else 0
+        target_bid = self._pasted_floor_int(fair - make_edge - (skew if pos_frac > 0 else 0))
+        target_ask = self._pasted_ceil_int(fair + make_edge + (skew if pos_frac < 0 else 0))
+
+        bid_price = min(best_bid + 1, target_bid)
+        ask_price = max(best_ask - 1, target_ask)
+        if bid_price >= ask_price:
+            bid_price = target_bid
+            ask_price = max(target_ask, bid_price + 1)
+        if bid_price >= best_ask:
+            bid_price = best_ask - 1
+        if ask_price <= best_bid:
+            ask_price = best_bid + 1
+
+        if not warming_up and not skip_make:
+            if asym_make == "ask_only":
+                if sell_cap > 0:
+                    orders.append(Order(voucher, int(ask_price), -int(min(sell_cap, self.PASTED_VEV_MAKE_SIZE))))
+            elif asym_make == "bid_only":
+                if buy_cap > 0:
+                    orders.append(Order(voucher, int(bid_price), int(min(buy_cap, self.PASTED_VEV_MAKE_SIZE))))
+            else:
+                if buy_cap > 0:
+                    orders.append(Order(voucher, int(bid_price), int(min(buy_cap, self.PASTED_VEV_MAKE_SIZE))))
+                if sell_cap > 0:
+                    orders.append(Order(voucher, int(ask_price), -int(min(sell_cap, self.PASTED_VEV_MAKE_SIZE))))
+        return orders
+
+    def get_pasted_deep_itm_orders(self, state: TradingState, data: dict, S: float) -> dict[Symbol, list[Order]]:
+        """Use pasted/v12 deep-ITM voucher logic for VEV_4000 and VEV_4500 only."""
+        out: dict[Symbol, list[Order]] = {}
+        if not self.ENABLE_PASTED_DEEP_ITM:
+            return out
+
+        long_regime = self._update_pasted_long_regime(data, S)
+        warming_up = int(data.get("ticks", 0)) <= self.WARMUP_TICKS
+
+        for voucher, strike in (("VEV_4000", 4000), ("VEV_4500", 4500)):
+            depth = state.order_depths.get(voucher)
+            if depth is None:
+                continue
+            book = self._pasted_book(depth)
+            if book["best_bid"] is None or book["best_ask"] is None:
+                continue
+
+            pos = self.position(state, voucher)
+            limit = self.POSITION_LIMITS.get(voucher, 300)
+
+            if long_regime:
+                orders = self._pasted_v4_glide(
+                    voucher,
+                    book,
+                    pos,
+                    int(limit * self.PASTED_VEV_MAX_POS_FRAC),
+                    self.PASTED_DEEP_ITM_GLIDE,
+                )
+            else:
+                bs_theo = max(S - strike, 0.0) + 0.5
+                key = "pasted_intrinsic_bias_" + voucher
+                cur = float(data.get(key, 0.0))
+                mid_here = book["mid"]
+                if mid_here is not None:
+                    cur = ((1.0 - self.PASTED_DEEP_ITM_BIAS_ALPHA) * cur
+                           + self.PASTED_DEEP_ITM_BIAS_ALPHA * (mid_here - bs_theo))
+                    data[key] = cur
+                fair = bs_theo + cur
+                orders = self._pasted_voucher_mm(
+                    voucher,
+                    book,
+                    pos,
+                    limit,
+                    fair,
+                    intrinsic=True,
+                    warming_up=warming_up,
+                )
+
+            if orders:
+                out[voucher] = orders
+                logger.print("PASTED_DEEP", voucher, "pos", pos, "S", round(S, 2), "long_regime", long_regime)
+        return out
+
+    def run(self, state: TradingState) -> tuple[dict[Symbol, list[Order]], int, str]:
+        result: dict[Symbol, list[Order]] = {}
+        conversions = 0
+        data = self.load_data(state.traderData)
+
+        vfe_depth = state.order_depths.get("VELVETFRUIT_EXTRACT")
+        if vfe_depth is None:
+            trader_data = json.dumps(data, separators=(",", ":"))
+            logger.flush(state, result, conversions, trader_data)
+            return result, conversions, trader_data
+
+        S = self.mid(vfe_depth)
+        if S is None:
+            trader_data = json.dumps(data, separators=(",", ":"))
+            logger.flush(state, result, conversions, trader_data)
+            return result, conversions, trader_data
+
+        z, direction, ema, obi = self.update_mr_signal(state, data, S)
+
+        for product in self.active_products():
+            if product not in state.order_depths:
+                continue
+
+            target = self.target_position(product, direction, z)
+            orders = self.trade_to_target(state, product, target, z)
+            if orders:
+                result[product] = orders
+
+
+        # Hybrid override: pasted/v12 logic only for VEV_4000 and VEV_4500.
+        # The numbered strategy remains responsible for every other voucher plus Hydro.
+        pasted_deep_orders = self.get_pasted_deep_itm_orders(state, data, S)
+        for product, orders in pasted_deep_orders.items():
+            result[product] = orders
+
+        # Hydrogel uses the Round 1 Osmium-style depth/Kalman market maker.
+        # It is independent from the VFE/VEV mean-reversion loop above.
+        if self.ENABLE_HYDROGEL and self.HYDRO_PRODUCT in state.order_depths:
+            hydro_orders = self.get_hydrogel_orders(
+                self.HYDRO_PRODUCT,
+                state.order_depths[self.HYDRO_PRODUCT],
+                self.position(state, self.HYDRO_PRODUCT),
+                data,
+            )
+            if hydro_orders:
+                result[self.HYDRO_PRODUCT] = hydro_orders
+
+        logger.print(
+            "S", round(S, 2),
+            "ema", round(ema, 2),
+            "z", round(z, 3),
+            "dir", direction,
+            "obi", round(obi, 3),
+            "ticks", data.get("ticks", 0),
+        )
+
+        trader_data = json.dumps(data, separators=(",", ":"))
+        logger.flush(state, result, conversions, trader_data)
+        return result, conversions, trader_data

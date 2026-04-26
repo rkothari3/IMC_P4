@@ -282,7 +282,7 @@ class Trader:
     OU_STEP = 300
 
     VOUCHER_LIMIT = 300
-    ROUND_TTE_DAYS = 5.0      # Round 3 = 5, Round 4 = 4, Round 5 = 3 — update each round
+    ROUND_TTE_DAYS = 4.0      # Round 3 = 5, Round 4 = 4, Round 5 = 3 — update each round
     DAYS_PER_YEAR = 252.0
 
     CLEAR_BAND = 0.15
