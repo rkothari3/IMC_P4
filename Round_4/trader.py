@@ -286,6 +286,10 @@ class Trader:
     DAYS_PER_YEAR = 252.0
 
     CLEAR_BAND = 0.15
+    CLEAR_BAND_BY_PRODUCT: dict = {"VEV_5400": 6.0}  # per-product override; falls through to CLEAR_BAND
+    MARK01_INTERCEPT_ENABLED = False
+    MARK01_EDGE_MULT = 1.0
+    MARK01_ACTIVE_TICKS = 500
     PASSIVE_ONLY_IF_SPREAD_AT_LEAST = 2.0
     MAX_PASSIVE_ABS_POS = 180
     SECOND_HALF_EDGE_MULT = 0.90
@@ -1009,6 +1013,16 @@ class Trader:
                 edge *= self.SECOND_HALF_EDGE_MULT
                 take_size = int(round(take_size * self.SECOND_HALF_TAKE_MULT))
 
+            # Mark 01 intercept: detect buyer activity and lower edge to front-run Mark 22
+            if self.MARK01_INTERCEPT_ENABLED:
+                for trade in state.market_trades.get(product, []):
+                    if getattr(trade, 'buyer', '') == "Mark 01":
+                        data[f"m01_last_{product}"] = state.timestamp
+                        break
+                m01_last = int(data.get(f"m01_last_{product}", -999999))
+                if state.timestamp - m01_last <= self.MARK01_ACTIVE_TICKS:
+                    edge *= self.MARK01_EDGE_MULT
+
             orders: List[Order] = []
             taking_profit = False
 
@@ -1065,12 +1079,13 @@ class Trader:
                     projected_option_delta -= qty * option_delta
 
             clear_size = int(cfg["clear_size"])
-            if position > 0 and best_bid >= fair - self.CLEAR_BAND:
+            clear_band = self.CLEAR_BAND_BY_PRODUCT.get(product, self.CLEAR_BAND)
+            if position > 0 and best_bid >= fair - clear_band:
                 qty = min(position, bid_vol, clear_size)
                 if qty > 0:
                     orders.append(Order(product, best_bid, -qty))
                     position -= qty; projected_option_delta -= qty * option_delta
-            elif position < 0 and best_ask <= fair + self.CLEAR_BAND:
+            elif position < 0 and best_ask <= fair + clear_band:
                 qty = min(-position, ask_vol, clear_size)
                 if qty > 0:
                     orders.append(Order(product, best_ask, qty))
