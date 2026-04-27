@@ -257,7 +257,7 @@ class Trader:
     HYDRO_ANCHOR = 10000.0            # soft anchor; only 25% weight, Kalman adapts
     ENABLE_HYDRO_GAP_ALPHA = True
     HYDRO_GAP_THRESHOLD = 1
-    HYDRO_GAP_ALPHA_STRENGTH = 2.0
+    HYDRO_GAP_ALPHA_STRENGTH = 1.0
     ENABLE_HYDRO_GAP_SIZE_SKEW = False
     HYDRO_GAP_FAVORED_SIZE_SCALE = 1.50
     HYDRO_GAP_TOXIC_SIZE_SCALE = 0.40
@@ -265,10 +265,10 @@ class Trader:
     HYDRO_ANCHOR_WEIGHT = 0.10
     HYDRO_USE_TREND_BLOCK = True
     HYDRO_TREND_WINDOW = 50
-    HYDRO_CRASH_BLOCK_LONGS = 25.0
-    HYDRO_RIP_BLOCK_SHORTS = 25.0
-    HYDRO_DISABLE_BID_ABOVE_POS = 180
-    HYDRO_DISABLE_ASK_BELOW_POS = -180
+    HYDRO_CRASH_BLOCK_LONGS = 15.0
+    HYDRO_RIP_BLOCK_SHORTS = 15.0
+    HYDRO_DISABLE_BID_ABOVE_POS = 160
+    HYDRO_DISABLE_ASK_BELOW_POS = -160
 
     # === OPTIONS CONFIG ===
     # VEV_4500 added: historical data showed 1 trade/3 days (illiquid) but actual Round 3
@@ -298,6 +298,10 @@ class Trader:
     MR_POSITION_SIZE = 15
     MR_ENABLED = False
     IV_SCALP_ENABLED = False
+
+    VE_MM_ENABLED = False
+    VE_MM_LIMIT = 100
+    VE_MM_QTY = 5
 
     VE_LIMIT = 0
     MAX_ABS_OPTION_DELTA = 999.0
@@ -1125,6 +1129,20 @@ class Trader:
                     result.setdefault(VE, []).append(Order(VE, ve_best_bid, -qty))
 
         self._apply_swing_rules(state, result, data)
+
+        # VE passive MM — capture Mark 55 when swing rules are idle
+        if self.VE_MM_ENABLED and VE not in result and ve_best_bid is not None and ve_best_ask is not None:
+            ve_pos = int(state.position.get(VE, 0))
+            bid_qty = abs(int(ve_depth.buy_orders.get(ve_best_bid, 0)))
+            ask_qty = abs(int(ve_depth.sell_orders.get(ve_best_ask, 0)))
+            if ve_pos < self.VE_MM_LIMIT and bid_qty > 0:
+                qty = min(self.VE_MM_QTY, self.VE_MM_LIMIT - ve_pos, bid_qty)
+                if qty > 0:
+                    result.setdefault(VE, []).append(Order(VE, ve_best_bid, qty))
+            if ve_pos > -self.VE_MM_LIMIT and ask_qty > 0:
+                qty = min(self.VE_MM_QTY, self.VE_MM_LIMIT + ve_pos, ask_qty)
+                if qty > 0:
+                    result.setdefault(VE, []).append(Order(VE, ve_best_ask, -qty))
 
         for product in self.OU_PRODUCTS:
             if product in ou_orders:
