@@ -124,13 +124,67 @@ class BotTracker:
     Mark 38 warmth is shared across HG, VEV_4000, VEV_4500 — when Mark 38
     trades any of them, all three warm up. This solves VEV_4500 cold-start
     (almost no bot-to-bot trades in historical data for that product).
+
+    Also tracks informed signals (id_sig) for price direction prediction.
     """
     DECAY = 0.999
     BUMP  = 0.40
     MARK38_PRODUCTS = (HYDROGEL, "VEV_4000", "VEV_4500")
+    ID_SIG_DECAY = 0.80  # Decay for informed signals
+    ID_SIG_THRESH = 0.35  # Threshold to drop id_sig
+
+    @staticmethod
+    def _update_id_sig(data: dict, product: str, val: float) -> None:
+        """Add to informed signal for a product."""
+        key = f"id_sig_{product}"
+        data[key] = data.get(key, 0.0) + val
+
+    @staticmethod
+    def _decay_id_sigs(data: dict) -> None:
+        """Decay all id_sigs and remove small ones."""
+        for key in list(data.keys()):
+            if key.startswith("id_sig_"):
+                data[key] *= BotTracker.ID_SIG_DECAY
+                if abs(data[key]) < BotTracker.ID_SIG_THRESH:
+                    del data[key]
 
     @staticmethod
     def update(data: dict, market_trades: dict) -> None:
+        # Decay existing id_sigs first
+        BotTracker._decay_id_sigs(data)
+
+        # Update id_sigs from market trades (vev4.py style)
+        for product, trades in market_trades.items():
+            for t in trades:
+                q = abs(t.quantity)
+                b = getattr(t, "buyer", "") or ""
+                s = getattr(t, "seller", "") or ""
+
+                if product == HYDROGEL:
+                    # Mark 14 informed both sides, Mark 38 anti-informed
+                    if b == "Mark 14": BotTracker._update_id_sig(data, product, +0.22 * q)
+                    if s == "Mark 14": BotTracker._update_id_sig(data, product, -0.22 * q)
+                    if b == "Mark 38": BotTracker._update_id_sig(data, product, -0.22 * q)
+                    if s == "Mark 38": BotTracker._update_id_sig(data, product, +0.22 * q)
+
+                elif product == VE:
+                    # Strongest signals on VELVET
+                    if b == "Mark 01": BotTracker._update_id_sig(data, product, +0.16 * q)
+                    if s == "Mark 01": BotTracker._update_id_sig(data, product, -0.16 * q)
+                    if b == "Mark 14": BotTracker._update_id_sig(data, product, +0.14 * q)
+                    if s == "Mark 14": BotTracker._update_id_sig(data, product, -0.14 * q)
+                    if b == "Mark 67": BotTracker._update_id_sig(data, product, +0.22 * q)
+                    if b == "Mark 55": BotTracker._update_id_sig(data, product, -0.18 * q)
+                    if s == "Mark 55": BotTracker._update_id_sig(data, product, +0.18 * q)
+                    if s == "Mark 49": BotTracker._update_id_sig(data, product, +0.12 * q)
+
+                elif product == "VEV_4000":
+                    # Mark 14 informed, Mark 38 anti-informed for deep ITM
+                    if b == "Mark 14": BotTracker._update_id_sig(data, product, +0.20 * q)
+                    if s == "Mark 14": BotTracker._update_id_sig(data, product, -0.20 * q)
+                    if b == "Mark 38": BotTracker._update_id_sig(data, product, -0.20 * q)
+                    if s == "Mark 38": BotTracker._update_id_sig(data, product, +0.20 * q)
+
         w38 = float(data.get("warm_m38", 0.0)) * BotTracker.DECAY
         hydro_flow = float(data.get("hydro_flow_m38", 0.0)) * 0.90
         hydro_signed = 0
@@ -212,10 +266,10 @@ class Trader:
     HYDRO_RIP_BLOCK_SHORTS    = 15.0
     HYDRO_DISABLE_BID_ABOVE   = 160
     HYDRO_DISABLE_ASK_BELOW   = -160
-    HYDRO_ALPHA_BUY_LEVEL     = 9985
-    HYDRO_ALPHA_SELL_LEVEL    = 10015
-    HYDRO_ALPHA2_BUY_LEVEL    = 9992
-    HYDRO_ALPHA2_SELL_LEVEL   = 10008
+    HYDRO_ALPHA_BUY_OFFSET    = -15   # relative to HYDRO_ANCHOR
+    HYDRO_ALPHA_SELL_OFFSET   = +15
+    HYDRO_ALPHA2_BUY_OFFSET   = -8
+    HYDRO_ALPHA2_SELL_OFFSET  = +8
     HYDRO_ALPHA2_TARGET       = 120
 
     # === VEV SPOT MM ===
@@ -224,6 +278,12 @@ class Trader:
     VE_MM_MIN_SPREAD = 3
 
     # === DEEP ITM (VEV_4000 / VEV_4500) ===
+    # EMA Mean Reversion config (from vev4.py) - CRITICAL: MEAN is historical anchor, NOT current price
+    DEEP_ITM_EMA_CFG = {
+        "VEV_4000": {"limit": 300, "mean": 1250, "edge": 4, "thresh": 10, "take": 80, "alpha": 0.01, "wide": 10, "imb_w": 0.40, "delta": 1.0},
+        "VEV_4500": {"limit": 300, "mean": 750,  "edge": 3, "thresh": 16, "take": 80, "alpha": 0.01, "wide": 8,  "imb_w": 0.20, "delta": 1.0},
+    }
+    # Legacy config (kept for reference, not used in new EMA MR logic)
     DEEP_ITM_CFG = {
         "VEV_4000": {"strike": 4000, "sigma": 0.25, "min_spread": 6,
                      "base_size": 30, "boost": 50, "take_edge": 10.0, "limit": 300},
@@ -231,13 +291,10 @@ class Trader:
                      "base_size": 25, "boost": 45, "take_edge": 10.0, "limit": 300},
     }
 
-    # === OU (VE spot + VEV_4000/4500 + VEV_5000–5300) ===
-    # Extend OU to deep-ITM and spot: delta≈1 options move 1:1 with spot,
-    # so a cheap-VEV signal should also buy deep ITM calls (and spot itself).
-    OU_PRODUCTS      = (VE, "VEV_4000", "VEV_4500",
-                        "VEV_5000", "VEV_5100", "VEV_5200", "VEV_5300")
-    OU_PRODUCT_LIMIT = {VE: 200, "VEV_4000": 300, "VEV_4500": 300,
-                        "VEV_5000": 300, "VEV_5100": 300,
+    # === OU (VE spot + VEV_5000–5300) ===
+    # Note: VEV_4000/4500 now handled by EMA MR in _deep_itm_mm, not OU
+    OU_PRODUCTS      = (VE, "VEV_5000", "VEV_5100", "VEV_5200", "VEV_5300")
+    OU_PRODUCT_LIMIT = {VE: 200, "VEV_5000": 300, "VEV_5100": 300,
                         "VEV_5200": 300, "VEV_5300": 300}
     OU_EMA_SPAN   = 1250
     OU_ENTRY_DEV  = 17.423
@@ -268,17 +325,18 @@ class Trader:
     MAX_STRATEGY_SHORT     = 300
 
     OTM_VOUCHERS = {
-        "VEV_5400": {"strike": 5400, "sigma": 0.191, "edge": 0.35,
+        "VEV_5400": {"strike": 5400, "sigma": 0.215, "edge": 0.35,
                      "take_size": 32, "mm_size": 12, "mm_width": 0.85, "clear_size": 18},
-        "VEV_5500": {"strike": 5500, "sigma": 0.210, "edge": 0.40,
+        "VEV_5500": {"strike": 5500, "sigma": 0.230, "edge": 0.40,
                      "take_size": 24, "mm_size": 10, "mm_width": 0.90, "clear_size": 16},
     }
     MAX_LONG_BY_PRODUCT  = {"VEV_5300": 100, "VEV_5400": 0, "VEV_5500": 0}
     MAX_SHORT_BY_PRODUCT = {"VEV_5400": 300, "VEV_5500": 300}
-    EARLY_MAX_SHORT      = {"VEV_5400": 90,  "VEV_5500": 50}
+    EARLY_MAX_SHORT      = {"VEV_5400": 300, "VEV_5500": 200}
     MIN_SELL_PRICE       = {"VEV_5400": 18,  "VEV_5500": 7}
-    SECOND_ENTRY_MIN_SELL= {"VEV_5400": 16,  "VEV_5500": 7}
-    PROFIT_TAKE_ASK      = {"VEV_5400": 12,  "VEV_5500": 4}
+    SECOND_ENTRY_MIN_SELL= {"VEV_5400": 14,  "VEV_5500": 5}
+    PROFIT_TAKE_ASK      = {"VEV_5400": 14,  "VEV_5500": 5}
+    OTM_NO_CLOSE_GATE    = {"VEV_5400", "VEV_5500"}  # these cycle freely
 
     # === VE SWING (for OTM pass cycle detection) ===
     SWING_WINDOW = 80
@@ -311,6 +369,13 @@ class Trader:
             "ve_regime": 0,
             "ou_signal": 0,
             "ou_signal_deep_itm": 0,
+            # Deep ITM EMA state - initialized to historical means, persist across days
+            "vev4000_ema": None,  # Will be set to 1250 on first tick
+            "vev4500_ema": None,  # Will be set to 750 on first tick
+            "vev4000_ema_fast": None,  # Fast EMA for trending detection
+            "vev4500_ema_fast": None,
+            "vev4000_basis_ema": None,
+            "vev4500_basis_ema": None,
         }
         if trader_data:
             try:
@@ -594,62 +659,144 @@ class Trader:
             result[VE] = orders
 
     # =========================================================================
-    # Module 3: Deep ITM MM (VEV_4000 / VEV_4500)
+    # Module 3: Deep ITM EMA Mean Reversion (VEV_4000 / VEV_4500)
+    # Ported from vev4.py - key insight: EMA initialized to historical mean (1250/750)
+    # NOT to current price, giving immediate meaningful deviation signal from tick 1
     # =========================================================================
 
     def _deep_itm_mm(self, state: TradingState, data: dict,
                       result: dict, ve_fair: float, tte: float) -> None:
-        warmth = float(data.get("warm_m38", 0.0))
-
-        for product, cfg in self.DEEP_ITM_CFG.items():
+        """
+        EMA-based mean reversion for deep ITM vouchers.
+        Critical fix: EMA initialized to historical mean, not current price.
+        """
+        for product in ("VEV_4000", "VEV_4500"):
+            cfg = self.DEEP_ITM_EMA_CFG[product]
             depth = state.order_depths.get(product)
             if not depth or not depth.buy_orders or not depth.sell_orders:
                 continue
-            bb  = max(depth.buy_orders);  bv = abs(int(depth.buy_orders[bb]))
-            ba  = min(depth.sell_orders); av = abs(int(depth.sell_orders[ba]))
-            spread = ba - bb
 
-            strike = int(cfg["strike"]); sigma = float(cfg["sigma"])
-            lim    = int(cfg["limit"]);  take_edge = float(cfg["take_edge"])
-            intrinsic = max(0.0, ve_fair - strike)
-            theo = max(intrinsic, BlackScholes.call_price(ve_fair, strike, tte, sigma))
+            LIMIT = cfg['limit']
+            HISTORICAL_MEAN = cfg['mean']  # 1250 for VEV_4000, 750 for VEV_4500
+            BASE_EDGE = cfg['edge']
+            REVERSION_THRESH = cfg['thresh']
+            MAX_TAKE = cfg['take']
+            EMA_ALPHA = cfg['alpha']
+            WIDE_THRESH = cfg['wide']
+            IMB_WEIGHT = cfg['imb_w']
+            DELTA = cfg['delta']
 
-            pos      = int(state.position.get(product, 0))
-            pos     += sum(o.quantity for o in result.get(product, []))
-            buy_room = max(0, lim - pos)
-            sel_room = max(0, lim + pos)
-            orders: List[Order] = list(result.get(product, []))
+            best_bid = max(depth.buy_orders.keys())
+            best_ask = min(depth.sell_orders.keys())
+            v1_b = depth.buy_orders[best_bid]
+            v1_a = abs(depth.sell_orders[best_ask])
+            spread = best_ask - best_bid
 
-            # Take obvious mispricings
-            if ba < theo - take_edge and buy_room > 0:
-                qty = min(20, buy_room, av)
-                if qty > 0:
-                    orders.append(Order(product, ba, qty))
-                    pos += qty; buy_room -= qty; sel_room += qty
+            # Micro-price with imbalance weighting
+            micro_price = (best_ask * v1_b + best_bid * v1_a) / (v1_b + v1_a)
+            imb = (v1_b - v1_a) / (v1_b + v1_a)
+            fair_value = micro_price + imb * spread * IMB_WEIGHT
 
-            if bb > theo + take_edge and sel_room > 0:
-                qty = min(20, sel_room, bv)
-                if qty > 0:
-                    orders.append(Order(product, bb, -qty))
-                    pos -= qty; sel_room -= qty; buy_room += qty
+            # Delta bias: deviation of basis (fair - spot*delta) from its EMA
+            # This creates quote skew based on relative value vs spot
+            delta_bias = 0.0
+            basis = fair_value - (ve_fair * DELTA)
+            basis_ema_key = f"vev{product[4:]}_basis_ema"
+            if data.get(basis_ema_key) is None:
+                data[basis_ema_key] = basis
+            data[basis_ema_key] = 0.08 * basis + 0.92 * data[basis_ema_key]
+            delta_bias = -(basis - data[basis_ema_key]) * 0.25
 
-            # Penny inside BBO when spread is wide enough
-            if spread >= int(cfg["min_spread"]):
-                qsize   = int(cfg["base_size"]) + int(int(cfg["boost"]) * warmth)
-                inv_skew= pos / float(lim)
-                bid_px  = bb + 1
-                ask_px  = ba - 1
+            # CRITICAL: EMA initialized to HISTORICAL_MEAN, not current price
+            # This gives immediate meaningful deviation signal from tick 1
+            ema_key = f"vev{product[4:]}_ema"  # vev4000_ema, vev4500_ema
+            ema_fast_key = f"{ema_key}_fast"
+            if data.get(ema_key) is None:
+                data[ema_key] = float(HISTORICAL_MEAN)
+                logger.print(f"{product}: EMA initialized to historical mean {HISTORICAL_MEAN}")
+            if data.get(ema_fast_key) is None:
+                data[ema_fast_key] = float(HISTORICAL_MEAN)
+            # Slow EMA with configured alpha
+            data[ema_key] = round(EMA_ALPHA * fair_value + (1 - EMA_ALPHA) * data[ema_key])
+            # Fast EMA with alpha=0.1 for trending detection
+            data[ema_fast_key] = round(0.1 * fair_value + 0.9 * data[ema_fast_key])
+            adaptive_mean = data[ema_key]
+            fast_mean = data[ema_fast_key]
 
-                if bid_px < ask_px:
-                    if buy_room > 0:
-                        bscale = max(0.1, 1.0 - max(0.0, inv_skew - 0.5) * 2.0)
-                        bqty   = min(max(1, int(qsize * bscale)), buy_room)
-                        orders.append(Order(product, bid_px, bqty))
+            # Detect trending: if fast EMA deviates significantly from slow EMA
+            trending = abs(fast_mean - adaptive_mean) > REVERSION_THRESH * 0.3
 
-                    if sel_room > 0:
-                        ascale = max(0.1, 1.0 - max(0.0, -inv_skew - 0.5) * 2.0)
-                        aqty   = min(max(1, int(qsize * ascale)), sel_room)
-                        orders.append(Order(product, ask_px, -aqty))
+            position = int(state.position.get(product, 0))
+            buy_cap = LIMIT - position
+            sell_cap = LIMIT + position
+            pos_ratio = position / LIMIT
+
+            # Get id_sig for this product (from BotTracker)
+            id_sig = data.get(f"id_sig_{product}", 0.0)
+
+            # Total bias includes delta_bias for quote skew + id_sig for informed direction
+            total_bias = delta_bias + 0.70 * max(-8.0, min(8.0, id_sig))
+
+            # Calculate deviation from adaptive mean for reversion signal
+            dist = fair_value - adaptive_mean
+
+            # Adjust dist by id_sig (strong signals should change taking behavior)
+            dist += 0.30 * max(-8.0, min(8.0, id_sig))
+
+            # Position-based skew for quotes
+            skew = pos_ratio * 2.0
+            our_bid = round((best_bid + 1 if spread > WIDE_THRESH else fair_value - BASE_EDGE) - skew + total_bias)
+            our_ask = round((best_ask - 1 if spread > WIDE_THRESH else fair_value + BASE_EDGE) - skew + total_bias)
+            our_bid = min(our_bid, best_ask - 1)
+            our_ask = max(our_ask, best_bid + 1)
+            if our_ask <= our_bid:
+                our_ask = our_bid + 1
+
+            base_qty = max(10, int(50 * (1 - abs(pos_ratio) ** 0.6 * 0.7)))
+            # Adjust threshold for trending (higher threshold when trending)
+            take_thresh = REVERSION_THRESH if not trending else int(REVERSION_THRESH * 1.5)
+
+            # Lower threshold for strong id signals
+            if abs(id_sig) > 6:
+                take_thresh = max(4, take_thresh - 1)
+
+            orders: List[Order] = []
+
+            # Mean reversion taking: when price deviates significantly from EMA
+            if dist <= -take_thresh and buy_cap > 0:
+                # Price below mean -> buy
+                take_qty = min(buy_cap, MAX_TAKE) if pos_ratio <= 0.3 else min(buy_cap, max(10, int(MAX_TAKE * 0.5)))
+                if take_qty > 0:
+                    orders.append(Order(product, best_ask, take_qty))
+                if buy_cap - take_qty > 0:
+                    orders.append(Order(product, our_bid, min(buy_cap - take_qty, base_qty)))
+            elif dist >= take_thresh and sell_cap > 0:
+                # Price above mean -> sell
+                take_qty = min(sell_cap, MAX_TAKE) if pos_ratio >= -0.3 else min(sell_cap, max(10, int(MAX_TAKE * 0.5)))
+                if take_qty > 0:
+                    orders.append(Order(product, best_bid, -take_qty))
+                if sell_cap - take_qty > 0:
+                    orders.append(Order(product, our_ask, -min(sell_cap - take_qty, base_qty)))
+            else:
+                # No strong signal: reduce position if too large, otherwise quote both sides
+                if position > LIMIT * 0.4 and sell_cap > 0:
+                    orders.append(Order(product, max(best_bid + 1, our_ask - 1), -min(sell_cap, int(position * 0.25), 30)))
+                elif position < -LIMIT * 0.4 and buy_cap > 0:
+                    orders.append(Order(product, min(best_ask - 1, our_bid + 1), min(buy_cap, int(abs(position) * 0.25), 30)))
+
+                bid_post = min(buy_cap, base_qty)
+                ask_post = min(sell_cap, base_qty)
+
+                # Reduce posting on side against strong informed signal
+                if id_sig > 8:
+                    ask_post = min(ask_post, max(10, base_qty // 2))
+                elif id_sig < -8:
+                    bid_post = min(bid_post, max(10, base_qty // 2))
+
+                if buy_cap > 0:
+                    orders.append(Order(product, our_bid, bid_post))
+                if sell_cap > 0:
+                    orders.append(Order(product, our_ask, -ask_post))
 
             if orders:
                 result[product] = orders
@@ -713,10 +860,7 @@ class Trader:
             bv = abs(int(d.buy_orders[pb])); av = abs(int(d.sell_orders[pa]))
             pos   = int(state.position.get(product, 0))
             plim  = int(self.OU_PRODUCT_LIMIT.get(product, self.OU_LIMIT))
-            if product in ("VEV_4000", "VEV_4500"):
-                target = plim * deep_signal
-            else:
-                target = plim * signal
+            target = plim * signal
             diff   = target - pos
             if diff > 0:
                 qty = min(diff, av, self.OU_STEP, plim - pos)
@@ -821,14 +965,14 @@ class Trader:
                     orders.append(Order(product, ba, qty))
                     pos += qty; buy_room -= qty; sel_room += qty
                     proj_delta += qty * odelta
-                    if pos >= 0:
+                    if pos >= 0 and product not in self.OTM_NO_CLOSE_GATE:
                         closed.add(product)
                         data["closed_products"] = sorted(closed)
 
             if product in closed and pos >= 0 and not armed2:
                 if orders: result[product] = orders
                 continue
-            if taking_profit:
+            if taking_profit and product not in self.OTM_NO_CLOSE_GATE:
                 result[product] = orders
                 continue
 
@@ -912,17 +1056,21 @@ class Trader:
             h = self._hydrogel_mm(od, int(state.position.get(HYDROGEL, 0)), data)
             if h:
                 result[HYDROGEL] = h
-            # Aggressive alpha overlay for large HG dislocations.
+            # Aggressive alpha overlay for large HG dislocations (offsets relative to anchor).
             h_pos = int(state.position.get(HYDROGEL, 0))
             h_bid = max(od.buy_orders)
             h_ask = min(od.sell_orders)
-            if h_ask < self.HYDRO_ALPHA_BUY_LEVEL and h_pos < self.HYDRO_LIMIT:
+            alpha_buy  = self.HYDRO_ANCHOR + self.HYDRO_ALPHA_BUY_OFFSET
+            alpha_sell = self.HYDRO_ANCHOR + self.HYDRO_ALPHA_SELL_OFFSET
+            alpha2_buy  = self.HYDRO_ANCHOR + self.HYDRO_ALPHA2_BUY_OFFSET
+            alpha2_sell = self.HYDRO_ANCHOR + self.HYDRO_ALPHA2_SELL_OFFSET
+            if h_ask < alpha_buy and h_pos < self.HYDRO_LIMIT:
                 result[HYDROGEL] = [Order(HYDROGEL, int(h_ask), int(self.HYDRO_LIMIT - h_pos))]
-            elif h_bid > self.HYDRO_ALPHA_SELL_LEVEL and h_pos > -self.HYDRO_LIMIT:
+            elif h_bid > alpha_sell and h_pos > -self.HYDRO_LIMIT:
                 result[HYDROGEL] = [Order(HYDROGEL, int(h_bid), int(-self.HYDRO_LIMIT - h_pos))]
-            elif h_ask < self.HYDRO_ALPHA2_BUY_LEVEL and h_pos < self.HYDRO_ALPHA2_TARGET:
+            elif h_ask < alpha2_buy and h_pos < self.HYDRO_ALPHA2_TARGET:
                 result[HYDROGEL] = [Order(HYDROGEL, int(h_ask), int(self.HYDRO_ALPHA2_TARGET - h_pos))]
-            elif h_bid > self.HYDRO_ALPHA2_SELL_LEVEL and h_pos > -self.HYDRO_ALPHA2_TARGET:
+            elif h_bid > alpha2_sell and h_pos > -self.HYDRO_ALPHA2_TARGET:
                 result[HYDROGEL] = [Order(HYDROGEL, int(h_bid), int(-self.HYDRO_ALPHA2_TARGET - h_pos))]
 
         # All options passes need VE depth
@@ -942,18 +1090,28 @@ class Trader:
         self._update_ve_swing(state, data)
         self._update_ve_cycle(data)
 
-        # 6. OU pass
+        # 4. Deep ITM EMA MR pass (VEV_4000/4500) - uses historical mean anchor
+        self._deep_itm_mm(state, data, result, ve_fair, tte)
+
+        # 5. OU pass (VE spot + VEV_5000–5300) - NOT VEV_4000/4500 anymore
         ou = self._ou_pass(state, data)
 
-        # 7. OTM pass
+        # 6. OTM pass
         self._otm_pass(state, data, result, ve_fair, tte)
 
-        # OU overwrites its products
+        # OU overwrites its products (now excludes VEV_4000/4500)
+        ou_signal = int(data.get("ou_signal", 0))
         for product in self.OU_PRODUCTS:
             if product in ou:
                 result[product] = ou[product]
             elif product in result:
-                del result[product]
+                # Keep VE spot MM orders when OU has no position directive
+                if product == VE and ou_signal == 0:
+                    pass
+                else:
+                    del result[product]
+
+        # Deep ITM products are set by _deep_itm_mm, don't let OU wipe them
 
         trader_data = self._dump_state(data)
         logger.flush(state, result, conversions, trader_data)

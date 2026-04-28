@@ -4,5 +4,5 @@ IMC_P4_Backtester/
 prosperity-cli/
 __pycache__/
 backtests/
-
-Round_4/
+.claude/
+.cursor/
