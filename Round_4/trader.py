@@ -148,6 +148,21 @@ class BotTracker:
         data["warm_m38"] = w38
         hydro_flow += max(-1.0, min(1.0, hydro_signed / 30.0))
         data["hydro_flow_m38"] = max(-1.0, min(1.0, hydro_flow))
+        # Discrete HG pressure regime with hysteresis.
+        hydro_burst = float(data.get("hydro_burst_m38", 0.0)) * 0.86
+        hydro_burst += max(-1.0, min(1.0, hydro_signed / 12.0))
+        hydro_burst = max(-3.0, min(3.0, hydro_burst))
+        data["hydro_burst_m38"] = hydro_burst
+        if hydro_burst >= 1.2:
+            data["hydro_regime"] = 2
+        elif hydro_burst >= 0.45:
+            data["hydro_regime"] = 1
+        elif hydro_burst <= -1.2:
+            data["hydro_regime"] = -2
+        elif hydro_burst <= -0.45:
+            data["hydro_regime"] = -1
+        else:
+            data["hydro_regime"] = 0
 
         w55 = float(data.get("warm_m55", 0.0)) * BotTracker.DECAY
         ve_flow = float(data.get("ve_flow", 0.0)) * 0.90
@@ -168,6 +183,21 @@ class BotTracker:
         data["warm_m55"] = w55
         ve_flow += max(-1.0, min(1.0, ve_signed / 40.0))
         data["ve_flow"] = max(-1.0, min(1.0, ve_flow))
+        # Discrete VE pressure regime from informed/taker flow.
+        ve_burst = float(data.get("ve_burst", 0.0)) * 0.88
+        ve_burst += max(-1.0, min(1.0, ve_signed / 20.0))
+        ve_burst = max(-3.0, min(3.0, ve_burst))
+        data["ve_burst"] = ve_burst
+        if ve_burst >= 1.2:
+            data["ve_regime"] = 2
+        elif ve_burst >= 0.45:
+            data["ve_regime"] = 1
+        elif ve_burst <= -1.2:
+            data["ve_regime"] = -2
+        elif ve_burst <= -0.45:
+            data["ve_regime"] = -1
+        else:
+            data["ve_regime"] = 0
 
 
 # ─── Trader ──────────────────────────────────────────────────────────────────
@@ -184,6 +214,9 @@ class Trader:
     HYDRO_DISABLE_ASK_BELOW   = -160
     HYDRO_ALPHA_BUY_LEVEL     = 9985
     HYDRO_ALPHA_SELL_LEVEL    = 10015
+    HYDRO_ALPHA2_BUY_LEVEL    = 9992
+    HYDRO_ALPHA2_SELL_LEVEL   = 10008
+    HYDRO_ALPHA2_TARGET       = 120
 
     # === VEV SPOT MM ===
     VE_MM_LIMIT      = 150
@@ -213,6 +246,7 @@ class Trader:
         "VEV_4000": 30.0,
         "VEV_4500": 30.0,
     }  # stricter deep-ITM trigger to avoid late-day incomplete OU cycles
+    OU_DEEP_FLOW_REGIME_ADJ = 0.0
     OU_LIMIT      = 300   # fallback; OU_PRODUCT_LIMIT takes priority
     OU_STEP       = 300
 
@@ -271,6 +305,10 @@ class Trader:
             "warm_m55": 0.0,
             "hydro_flow_m38": 0.0,
             "ve_flow": 0.0,
+            "hydro_burst_m38": 0.0,
+            "ve_burst": 0.0,
+            "hydro_regime": 0,
+            "ve_regime": 0,
             "ou_signal": 0,
             "ou_signal_deep_itm": 0,
         }
@@ -469,8 +507,11 @@ class Trader:
         if spread >= 14:
             flow = float(data.get("hydro_flow_m38", 0.0))
             shift = int(round(14.0 * flow))
-            bqty = buy(max(1, quote_size - shift), respect_block=False)
-            aqty = sell(max(1, quote_size + shift), respect_block=False)
+            regime = int(data.get("hydro_regime", 0))
+            bid_mult = max(0.35, min(1.8, 1.0 - 0.25 * regime))
+            ask_mult = max(0.35, min(1.8, 1.0 + 0.25 * regime))
+            bqty = buy(max(1, int((quote_size - shift) * bid_mult)), respect_block=False)
+            aqty = sell(max(1, int((quote_size + shift) * ask_mult)), respect_block=False)
             if bqty > 0:
                 orders.append(Order(HYDROGEL, best_bid + 1, bqty))
             if aqty > 0:
@@ -638,6 +679,11 @@ class Trader:
         elif dev < -self.OU_ENTRY_DEV:
             desired = 1
         deep_entry_dev = float(self.OU_ENTRY_DEV_BY_PRODUCT["VEV_4000"])
+        ve_regime = int(data.get("ve_regime", 0))
+        if ve_regime > 0:
+            deep_entry_dev += self.OU_DEEP_FLOW_REGIME_ADJ
+        elif ve_regime < 0:
+            deep_entry_dev -= self.OU_DEEP_FLOW_REGIME_ADJ
         if dev > deep_entry_dev:
             deep_desired = -1
         elif dev < -deep_entry_dev:
@@ -652,6 +698,11 @@ class Trader:
             signal = desired
         if deep_desired != deep_signal and tight:
             deep_signal = deep_desired
+        # Regime gate for deep-ITM: avoid fighting persistent informed flow.
+        if ve_regime <= -1 and deep_signal > 0:
+            deep_signal = 0
+        elif ve_regime >= 1 and deep_signal < 0:
+            deep_signal = 0
         data["ou_signal"] = signal
         data["ou_signal_deep_itm"] = deep_signal
         for product in self.OU_PRODUCTS:
@@ -869,6 +920,10 @@ class Trader:
                 result[HYDROGEL] = [Order(HYDROGEL, int(h_ask), int(self.HYDRO_LIMIT - h_pos))]
             elif h_bid > self.HYDRO_ALPHA_SELL_LEVEL and h_pos > -self.HYDRO_LIMIT:
                 result[HYDROGEL] = [Order(HYDROGEL, int(h_bid), int(-self.HYDRO_LIMIT - h_pos))]
+            elif h_ask < self.HYDRO_ALPHA2_BUY_LEVEL and h_pos < self.HYDRO_ALPHA2_TARGET:
+                result[HYDROGEL] = [Order(HYDROGEL, int(h_ask), int(self.HYDRO_ALPHA2_TARGET - h_pos))]
+            elif h_bid > self.HYDRO_ALPHA2_SELL_LEVEL and h_pos > -self.HYDRO_ALPHA2_TARGET:
+                result[HYDROGEL] = [Order(HYDROGEL, int(h_bid), int(-self.HYDRO_ALPHA2_TARGET - h_pos))]
 
         # All options passes need VE depth
         ve_depth = state.order_depths.get(VE)
