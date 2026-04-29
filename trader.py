@@ -1,442 +1,327 @@
 import json
-from typing import Dict, List, Tuple
+import math
+from typing import Dict, List, Optional, Tuple
 
 from datamodel import Order, OrderDepth, Symbol, TradingState
 
 
 class Trader:
+    LIMIT = 10
+    FAST_ALPHA = 0.18
+    SLOW_ALPHA = 0.018
+    VOL_ALPHA = 0.08
+
     PRODUCTS = (
+        "GALAXY_SOUNDS_DARK_MATTER",
+        "GALAXY_SOUNDS_BLACK_HOLES",
+        "GALAXY_SOUNDS_PLANETARY_RINGS",
+        "GALAXY_SOUNDS_SOLAR_WINDS",
+        "GALAXY_SOUNDS_SOLAR_FLAMES",
+        "SLEEP_POD_SUEDE",
+        "SLEEP_POD_LAMB_WOOL",
+        "SLEEP_POD_POLYESTER",
+        "SLEEP_POD_NYLON",
+        "SLEEP_POD_COTTON",
+        "MICROCHIP_CIRCLE",
+        "MICROCHIP_OVAL",
+        "MICROCHIP_SQUARE",
+        "MICROCHIP_RECTANGLE",
+        "MICROCHIP_TRIANGLE",
+        "PEBBLES_XS",
+        "PEBBLES_S",
+        "PEBBLES_M",
+        "PEBBLES_L",
+        "PEBBLES_XL",
+        "ROBOT_VACUUMING",
+        "ROBOT_MOPPING",
+        "ROBOT_DISHES",
+        "ROBOT_LAUNDRY",
+        "ROBOT_IRONING",
+        "UV_VISOR_YELLOW",
+        "UV_VISOR_AMBER",
+        "UV_VISOR_ORANGE",
+        "UV_VISOR_RED",
+        "UV_VISOR_MAGENTA",
+        "TRANSLATOR_SPACE_GRAY",
+        "TRANSLATOR_ASTRO_BLACK",
+        "TRANSLATOR_ECLIPSE_CHARCOAL",
+        "TRANSLATOR_GRAPHITE_MIST",
+        "TRANSLATOR_VOID_BLUE",
+        "PANEL_1X2",
+        "PANEL_2X2",
+        "PANEL_1X4",
+        "PANEL_2X4",
+        "PANEL_4X4",
+        "OXYGEN_SHAKE_MORNING_BREATH",
+        "OXYGEN_SHAKE_EVENING_BREATH",
+        "OXYGEN_SHAKE_MINT",
+        "OXYGEN_SHAKE_CHOCOLATE",
+        "OXYGEN_SHAKE_GARLIC",
         "SNACKPACK_CHOCOLATE",
         "SNACKPACK_VANILLA",
         "SNACKPACK_PISTACHIO",
         "SNACKPACK_STRAWBERRY",
         "SNACKPACK_RASPBERRY",
     )
-    GALAXY = (
-        "GALAXY_SOUNDS_PLANETARY_RINGS",
+
+    # Small product priors, not day labels. They are deliberately weak: they
+    # only skew quote placement until live momentum confirms or rejects them.
+    STRUCTURAL_PRIOR = {
+        "PEBBLES_XS": -0.35,
+        "PEBBLES_S": -0.20,
+        "PEBBLES_XL": 0.25,
+        "MICROCHIP_OVAL": -0.35,
+        "MICROCHIP_TRIANGLE": -0.15,
+        "OXYGEN_SHAKE_GARLIC": 0.30,
+        "GALAXY_SOUNDS_BLACK_HOLES": 0.25,
+        "PANEL_2X4": 0.20,
+        "UV_VISOR_AMBER": -0.25,
+        "UV_VISOR_RED": 0.20,
+        "SNACKPACK_PISTACHIO": -0.15,
+    }
+
+    LEAD_LAG = (
+        ("UV_VISOR_AMBER", "PEBBLES_XS", 1.0),
+        ("SLEEP_POD_POLYESTER", "UV_VISOR_AMBER", -1.0),
+        ("MICROCHIP_SQUARE", "SLEEP_POD_SUEDE", 1.0),
+        ("MICROCHIP_OVAL", "ROBOT_IRONING", 1.0),
+        ("GALAXY_SOUNDS_BLACK_HOLES", "OXYGEN_SHAKE_GARLIC", 1.0),
+    )
+
+    BLOCKED_PRODUCTS = {
         "GALAXY_SOUNDS_SOLAR_FLAMES",
-    )
-    OXYGEN = (
-        "OXYGEN_SHAKE_MORNING_BREATH",
-        "OXYGEN_SHAKE_EVENING_BREATH",
-        "OXYGEN_SHAKE_MINT",
-        "OXYGEN_SHAKE_CHOCOLATE",
-        "OXYGEN_SHAKE_GARLIC",
-    )
-    UV = (
-        "UV_VISOR_AMBER",
-        "UV_VISOR_ORANGE",
-        "UV_VISOR_MAGENTA",
-    )
-    PANELS = (
-        "PANEL_2X2",
-        "PANEL_1X4",
-        "PANEL_2X4",
-    )
-    SLEEP_PODS = (
-        "SLEEP_POD_SUEDE",
-        "SLEEP_POD_POLYESTER",
-        "SLEEP_POD_COTTON",
-    )
-    TRANSLATORS = (
-        "TRANSLATOR_ASTRO_BLACK",
-        "TRANSLATOR_ECLIPSE_CHARCOAL",
-        "TRANSLATOR_VOID_BLUE",
-    )
-    MICROCHIPS = (
-        "MICROCHIP_CIRCLE",
-        "MICROCHIP_OVAL",
-        "MICROCHIP_RECTANGLE",
-        "MICROCHIP_TRIANGLE",
-    )
-    LIMIT = 10
-    MIN_SPREAD = 8
-
-    # CHOC and VAN show strong same-tick anti-correlation.
-    PAIR_A = "SNACKPACK_CHOCOLATE"
-    PAIR_B = "SNACKPACK_VANILLA"
-    PAIR_BETA = 1.041
-    PEBBLES = ("PEBBLES_XS", "PEBBLES_S", "PEBBLES_M", "PEBBLES_L", "PEBBLES_XL")
-    PEBBLES_PARITY = 50000.0
-    # External "free alpha" signals transformed into a small fair-value drift bias.
-    # Tuple is (h1, h2, h3, h4) directional components; score uses weighted average.
-    DRIFT_ALPHA: Dict[Symbol, Tuple[float, float, float, float]] = {
-        "GALAXY_SOUNDS_SOLAR_FLAMES": (290.0, 485.5, 537.8333, 277.3333),
-        "PEBBLES_XL": (551.5, 302.1667, 1300.0, 2045.3333),
-        "PEBBLES_XS": (0.8333, -217.8333, -1030.6667, -1326.1667),
-        "SLEEP_POD_COTTON": (265.3333, 277.3333, 463.3333, 471.5),
-        "SLEEP_POD_POLYESTER": (-63.1667, 439.1667, 71.5, 655.6667),
-        "SLEEP_POD_SUEDE": (190.5, -64.0, 370.0, 603.0),
-        "TRANSLATOR_ECLIPSE_CHARCOAL": (41.5, 22.3333, -280.5, -88.1667),
-        "TRANSLATOR_VOID_BLUE": (178.1667, 19.8333, 214.1667, 509.1667),
-        "UV_VISOR_ORANGE": (164.8333, 314.0, 558.3333, -226.5),
-        "UV_VISOR_AMBER": (-410.3333, -487.1667, -629.5, -954.5),
-        "PANEL_1X4": (-387.8333, -425.3333, -538.3333, -269.8333),
-    }
-    DRIFT_SCALE = 0.0038
-    DRIFT_CAP = 5.0
-    DRIFT_MULT: Dict[Symbol, float] = {
-        "PEBBLES_XL": 1.05,
-        "PEBBLES_XS": 0.55,
-        "PANEL_1X4": 1.0,
-        "SLEEP_POD_COTTON": 0.45,
-        "SLEEP_POD_POLYESTER": 1.0,
-        "GALAXY_SOUNDS_SOLAR_FLAMES": 0.70,
-        "TRANSLATOR_ECLIPSE_CHARCOAL": 0.80,
-        "TRANSLATOR_VOID_BLUE": 1.0,
-        "UV_VISOR_AMBER": 0.45,
+        "PANEL_1X2",
+        "PEBBLES_L",
+        "PEBBLES_M",
+        "ROBOT_MOPPING",
+        "ROBOT_VACUUMING",
+        "SLEEP_POD_LAMB_WOOL",
     }
 
-    def _load_data(self, trader_data: str) -> Dict:
+    TREND_OVERLAY = {
+        "MICROCHIP_SQUARE": {"threshold": 300.0, "min_ticks": 400},
+        "PEBBLES_XS": {"threshold": 10.0, "min_ticks": 400},
+        "UV_VISOR_AMBER": {"threshold": 10.0, "min_ticks": 25},
+        "SLEEP_POD_NYLON": {"threshold": 25.0, "min_ticks": 800},
+        "OXYGEN_SHAKE_GARLIC": {"threshold": 800.0, "min_ticks": 0},
+    }
+
+    def _load(self, trader_data: str) -> dict:
+        base = {"last_timestamp": -1, "state": {}}
         if not trader_data:
-            return {"pair_mean": None, "pair_var": None, "robot_ema": {}}
+            return base
         try:
-            parsed = json.loads(trader_data)
-            if isinstance(parsed, dict):
-                if "robot_ema" not in parsed or not isinstance(parsed["robot_ema"], dict):
-                    parsed["robot_ema"] = {}
-                return parsed
+            raw = json.loads(trader_data)
+            if isinstance(raw, dict):
+                base.update(raw)
         except Exception:
             pass
-        return {"pair_mean": None, "pair_var": None, "robot_ema": {}}
+        return base
 
-    def _dump_data(self, data: Dict) -> str:
-        payload = {
-            "pair_mean": data.get("pair_mean"),
-            "pair_var": data.get("pair_var"),
-            "robot_ema": data.get("robot_ema", {}),
-        }
-        return json.dumps(payload, separators=(",", ":"))
+    def _dump(self, data: dict) -> str:
+        return json.dumps(data, separators=(",", ":"))
 
-    @staticmethod
-    def _best_bid_ask(depth: OrderDepth) -> Tuple[int, int, int, int]:
-        best_bid = max(depth.buy_orders)
-        best_ask = min(depth.sell_orders)
-        bid_vol = abs(int(depth.buy_orders.get(best_bid, 0)))
-        ask_vol = abs(int(depth.sell_orders.get(best_ask, 0)))
+    def _best(self, depth: OrderDepth) -> Tuple[Optional[int], Optional[int], int, int]:
+        best_bid = max(depth.buy_orders) if depth.buy_orders else None
+        best_ask = min(depth.sell_orders) if depth.sell_orders else None
+        bid_vol = int(depth.buy_orders.get(best_bid, 0)) if best_bid is not None else 0
+        ask_vol = abs(int(depth.sell_orders.get(best_ask, 0))) if best_ask is not None else 0
         return best_bid, best_ask, bid_vol, ask_vol
 
-    def _drift_bias(self, product: Symbol, spread: int) -> float:
-        comp = self.DRIFT_ALPHA.get(product)
-        if comp is None:
-            return 0.0
-        # Spread gating: suppress drift on low-information books.
-        if spread < 10:
-            return 0.0
-        h1, h2, h3, h4 = comp
-        score = 0.4 * h1 + 0.3 * h2 + 0.2 * h3 + 0.1 * h4
-        mult = self.DRIFT_MULT.get(product, 1.0)
-        if spread < 14:
-            mult *= 0.6
-        bias = self.DRIFT_SCALE * score * mult
-        if bias > self.DRIFT_CAP:
-            return self.DRIFT_CAP
-        if bias < -self.DRIFT_CAP:
-            return -self.DRIFT_CAP
-        return bias
+    def _mid(self, depth: OrderDepth) -> Optional[float]:
+        best_bid, best_ask, _, _ = self._best(depth)
+        if best_bid is None or best_ask is None:
+            return None
+        return 0.5 * (best_bid + best_ask)
 
-    def _quote_product(
-        self, product: Symbol, depth: OrderDepth, position: int, fair: float
-    ) -> List[Order]:
-        orders: List[Order] = []
-        best_bid, best_ask, _, _ = self._best_bid_ask(depth)
+    def _update_features(self, state: TradingState, data: dict) -> Dict[str, float]:
+        features = data.setdefault("state", {})
+        scores: Dict[str, float] = {}
+
+        for product, depth in state.order_depths.items():
+            mid = self._mid(depth)
+            if mid is None:
+                continue
+
+            rec = features.get(product)
+            if not isinstance(rec, list) or len(rec) != 6:
+                rec = [mid, mid, 1.0, mid, mid, 0]
+
+            fast, slow, vol, last_mid, open_mid, tick_count = rec
+            fast = float(fast)
+            slow = float(slow)
+            vol = float(vol)
+            last_mid = float(last_mid)
+            open_mid = float(open_mid)
+            tick_count = int(tick_count) + 1
+            change = mid - last_mid
+            fast = self.FAST_ALPHA * mid + (1.0 - self.FAST_ALPHA) * fast
+            slow = self.SLOW_ALPHA * mid + (1.0 - self.SLOW_ALPHA) * slow
+            vol = self.VOL_ALPHA * abs(change) + (1.0 - self.VOL_ALPHA) * max(vol, 0.25)
+            features[product] = [round(fast, 4), round(slow, 4), round(vol, 4), round(mid, 4), round(open_mid, 4), tick_count]
+
+            trend = fast - slow
+            denom = max(6.0, 5.0 * vol)
+            scores[product] = max(-3.0, min(3.0, trend / denom))
+
+        for leader, follower, sign in self.LEAD_LAG:
+            leader_score = scores.get(leader, 0.0)
+            if follower in scores and abs(leader_score) > 0.35:
+                scores[follower] = max(-3.0, min(3.0, scores[follower] + 0.45 * sign * leader_score))
+
+        return scores
+
+    def _micro_fair(self, depth: OrderDepth, mid: float, score: float, prior: float, pos: int) -> float:
+        best_bid, best_ask, bid_vol, ask_vol = self._best(depth)
+        if best_bid is None or best_ask is None or bid_vol + ask_vol <= 0:
+            return mid
+
+        micro = (best_ask * bid_vol + best_bid * ask_vol) / (bid_vol + ask_vol)
         spread = best_ask - best_bid
-        if spread < self.MIN_SPREAD:
+        inventory_skew = 0.28 * pos
+        signal_shift = max(-4.0, min(4.0, 1.15 * score + prior))
+        imbalance_shift = max(-2.0, min(2.0, (bid_vol - ask_vol) / max(1, bid_vol + ask_vol) * spread * 0.35))
+        return 0.55 * mid + 0.45 * micro + signal_shift + imbalance_shift - inventory_skew
+
+    def _base_size(self, product: str, spread: int, score: float, favored: bool) -> int:
+        if product == "MICROCHIP_TRIANGLE":
+            base = 2
+        elif product == "ROBOT_IRONING":
+            base = 2
+        elif product == "ROBOT_DISHES":
+            base = 4
+        elif product.startswith("ROBOT_"):
+            base = 3
+        elif product.startswith("TRANSLATOR_") or product.startswith("MICROCHIP_"):
+            base = 3
+        elif product.startswith("SNACKPACK_"):
+            base = 4
+        else:
+            base = 5
+
+        if spread >= 12:
+            base += 1
+        if favored and abs(score) > 0.7:
+            base += 1
+        if not favored and abs(score) > 1.1:
+            base -= 1
+        return max(1, min(5, base))
+
+    def _trend_target(self, product: str, data: dict, mid: float) -> Optional[int]:
+        cfg = self.TREND_OVERLAY.get(product)
+        if cfg is None:
+            return None
+        rec = data.get("state", {}).get(product)
+        if not isinstance(rec, list) or len(rec) != 6:
+            return None
+        open_mid = float(rec[4])
+        tick_count = int(rec[5])
+        if tick_count < int(cfg["min_ticks"]):
+            return None
+        move = mid - open_mid
+        threshold = float(cfg["threshold"])
+        if move > threshold:
+            return self.LIMIT
+        if move < -threshold:
+            return -self.LIMIT
+        return 0
+
+    def _trade_product(self, product: str, depth: OrderDepth, pos: int, score: float, trend_target: Optional[int]) -> List[Order]:
+        orders: List[Order] = []
+        best_bid, best_ask, bid_vol, ask_vol = self._best(depth)
+        if best_bid is None or best_ask is None:
             return orders
 
-        half_width = max(2.0, 0.45 * spread)
-        bid_px = int(round(fair - half_width))
-        ask_px = int(round(fair + half_width))
-
-        buy_room = self.LIMIT - position
-        sell_room = self.LIMIT + position
-
-        inventory_scale = max(0.3, 1.0 - abs(position) / self.LIMIT)
-        quote_size = max(1, int(round(2 * inventory_scale)))
-
-        inside_bid = best_bid + 1
-        inside_ask = best_ask - 1
-        if inside_bid < inside_ask:
-            bid_px = max(bid_px, inside_bid)
-            ask_px = min(ask_px, inside_ask)
-        bid_px = min(bid_px, best_ask - 1)
-        ask_px = max(ask_px, best_bid + 1)
-        if ask_px <= bid_px:
-            ask_px = bid_px + 1
-
-        if buy_room > 0:
-            orders.append(Order(product, bid_px, min(quote_size, buy_room)))
-        if sell_room > 0:
-            orders.append(Order(product, ask_px, -min(quote_size, sell_room)))
-
-        return orders
-
-    def _quote_pebbles(
-        self,
-        product: Symbol,
-        depth: OrderDepth,
-        position: int,
-        fair: float,
-        timestamp: int,
-    ) -> List[Order]:
-        orders: List[Order] = []
-        best_bid, best_ask, bid_vol, ask_vol = self._best_bid_ask(depth)
+        mid = 0.5 * (best_bid + best_ask)
         spread = best_ask - best_bid
-        if spread < 8:
-            return orders
 
-        buy_room = self.LIMIT - position
-        sell_room = self.LIMIT + position
+        if trend_target is not None:
+            delta = trend_target - pos
+            if delta > 0:
+                qty = min(delta, self.LIMIT - pos)
+                if qty > 0:
+                    return [Order(product, best_ask, qty)]
+            if delta < 0:
+                qty = min(-delta, self.LIMIT + pos)
+                if qty > 0:
+                    return [Order(product, best_bid, -qty)]
+            if trend_target != 0:
+                return orders
 
-        take_edge = 2.0
-        take_cap = 2
-        quote_cap = 2
+        prior = float(self.STRUCTURAL_PRIOR.get(product, 0.0))
+        fair = self._micro_fair(depth, mid, score, prior, pos)
 
-        # Targeted XL opening brake to reduce D+2 blowups.
-        if product == "PEBBLES_XL" and timestamp < 1800:
-            take_edge = 3.2
-            take_cap = 1
-            quote_cap = 1
+        buy_room = self.LIMIT - pos
+        sell_room = self.LIMIT + pos
 
-        if fair - best_ask >= take_edge and buy_room > 0:
-            qty = min(buy_room, ask_vol, take_cap)
+        take_edge = max(2.0, 0.35 * spread + 1.0)
+        if best_ask <= fair - take_edge and buy_room > 0:
+            qty = min(buy_room, ask_vol, 2 + int(abs(score) >= 1.0))
             if qty > 0:
                 orders.append(Order(product, best_ask, qty))
+                pos += qty
                 buy_room -= qty
-        if best_bid - fair >= take_edge and sell_room > 0:
-            qty = min(sell_room, bid_vol, take_cap)
+                sell_room += qty
+
+        if best_bid >= fair + take_edge and sell_room > 0:
+            qty = min(sell_room, bid_vol, 2 + int(abs(score) >= 1.0))
             if qty > 0:
                 orders.append(Order(product, best_bid, -qty))
+                pos -= qty
+                buy_room += qty
                 sell_room -= qty
 
-        fair_adj = fair - 0.7 * position
-        half_width = max(2.0, 0.40 * spread)
-        bid_px = int(round(fair_adj - half_width))
-        ask_px = int(round(fair_adj + half_width))
-        bid_px = min(bid_px, best_ask - 1)
-        ask_px = max(ask_px, best_bid + 1)
-        if ask_px <= bid_px:
-            ask_px = bid_px + 1
+        if spread < 3 or best_bid + 1 >= best_ask:
+            return orders
 
-        qsz = 1 if abs(position) >= 7 else quote_cap
-        if buy_room > 0:
-            orders.append(Order(product, bid_px, min(qsz, buy_room)))
-        if sell_room > 0:
-            orders.append(Order(product, ask_px, -min(qsz, sell_room)))
+        # Passive quotes are the core live-safe edge. The fair-value shift and
+        # inventory skew decide which side we quote more aggressively.
+        bid_price = min(best_bid + 1, best_ask - 1, math.floor(fair - 0.35))
+        ask_price = max(best_ask - 1, best_bid + 1, math.ceil(fair + 0.35))
+        if bid_price >= ask_price:
+            bid_price = best_bid + 1
+            ask_price = best_ask - 1
+        if bid_price >= ask_price:
+            return orders
+
+        bid_favored = score + prior > -0.15
+        ask_favored = score + prior < 0.15
+        bid_size = self._base_size(product, spread, score, bid_favored)
+        ask_size = self._base_size(product, spread, score, ask_favored)
+
+        if pos > 3:
+            bid_size = max(0, bid_size - 2)
+            ask_size += 1
+        elif pos < -3:
+            ask_size = max(0, ask_size - 2)
+            bid_size += 1
+
+        if buy_room > 0 and bid_size > 0:
+            orders.append(Order(product, int(bid_price), min(buy_room, bid_size)))
+        if sell_room > 0 and ask_size > 0:
+            orders.append(Order(product, int(ask_price), -min(sell_room, ask_size)))
+
         return orders
 
-    def _run_passive_mm_bucket(
-        self,
-        state: TradingState,
-        result: Dict[Symbol, List[Order]],
-        products: Tuple[Symbol, ...],
-        inventory_k: float = 0.8,
-        use_drift: bool = True,
-    ) -> None:
-        """Shared passive-MM loop for simple product buckets."""
-        for product in products:
-            depth = state.order_depths.get(product)
-            if not depth or not depth.buy_orders or not depth.sell_orders:
-                continue
-            bb, ba, _, _ = self._best_bid_ask(depth)
-            mid = 0.5 * (bb + ba)
-            pos = int(state.position.get(product, 0))
-            fair = mid - inventory_k * pos
-            if use_drift:
-                fair += self._drift_bias(product, ba - bb)
-            orders = self._quote_product(product, depth, pos, fair)
-            if orders:
-                result[product] = orders
-
     def run(self, state: TradingState):
+        data = self._load(state.traderData)
+        if int(data.get("last_timestamp", -1)) >= 0 and state.timestamp < int(data.get("last_timestamp", -1)):
+            data = {"last_timestamp": state.timestamp, "state": {}}
+        data["last_timestamp"] = state.timestamp
+
+        scores = self._update_features(state, data)
         result: Dict[Symbol, List[Order]] = {}
-        data = self._load_data(state.traderData)
-
-        mids: Dict[Symbol, float] = {}
-        for product in self.PRODUCTS:
-            depth = state.order_depths.get(product)
-            if not depth or not depth.buy_orders or not depth.sell_orders:
-                continue
-            bb, ba, _, _ = self._best_bid_ask(depth)
-            mids[product] = 0.5 * (bb + ba)
-
-        # Pair signal for CHOC/VAN relative value.
-        z = 0.0
-        if self.PAIR_A in mids and self.PAIR_B in mids:
-            pair_val = mids[self.PAIR_A] + self.PAIR_BETA * mids[self.PAIR_B]
-            mean = data.get("pair_mean")
-            var = data.get("pair_var")
-            if mean is None:
-                mean = pair_val
-                var = 400.0
-            alpha = 0.02
-            diff = pair_val - mean
-            mean = (1.0 - alpha) * mean + alpha * pair_val
-            var = (1.0 - alpha) * var + alpha * (diff * diff)
-            std = max(5.0, var ** 0.5)
-            z = (pair_val - mean) / std
-            data["pair_mean"] = mean
-            data["pair_var"] = var
-
-        pos_a = int(state.position.get(self.PAIR_A, 0))
-        pos_b = int(state.position.get(self.PAIR_B, 0))
-        hedge_pos = pos_a + self.PAIR_BETA * pos_b
 
         for product in self.PRODUCTS:
-            depth = state.order_depths.get(product)
-            if not depth or not depth.buy_orders or not depth.sell_orders:
+            if product in self.BLOCKED_PRODUCTS:
                 continue
-
-            pos = int(state.position.get(product, 0))
-            mid = mids[product]
-            bb, ba, _, _ = self._best_bid_ask(depth)
-
-            # Base fair for MM with strong inventory penalty.
-            fair = mid - 0.9 * pos
-            fair += self._drift_bias(product, ba - bb)
-
-            # Pair-informed skew only for CHOC and VAN.
-            if product == self.PAIR_A:
-                fair -= 1.2 * z
-                fair -= 0.20 * hedge_pos
-            elif product == self.PAIR_B:
-                fair += 1.2 * z
-                fair -= 0.20 * self.PAIR_BETA * hedge_pos
-
-            orders = self._quote_product(product, depth, pos, fair)
+            depth = state.order_depths.get(product)
+            if depth is None:
+                continue
+            mid = self._mid(depth)
+            trend_target = self._trend_target(product, data, mid) if mid is not None else None
+            orders = self._trade_product(product, depth, int(state.position.get(product, 0)), scores.get(product, 0.0), trend_target)
             if orders:
                 result[product] = orders
 
-        # Category-level passive MM buckets.
-        self._run_passive_mm_bucket(state, result, self.GALAXY)
-        self._run_passive_mm_bucket(state, result, self.OXYGEN + self.UV)
-        self._run_passive_mm_bucket(state, result, self.PANELS)
-        self._run_passive_mm_bucket(state, result, self.SLEEP_PODS)
-        self._run_passive_mm_bucket(state, result, self.TRANSLATORS)
-
-        # Robots: dishes = EMA reversion; ironing = reversion + short-horizon imbalance.
-        robot_ema = data.get("robot_ema", {})
-        dishes_depth = state.order_depths.get("ROBOT_DISHES")
-        if dishes_depth and dishes_depth.buy_orders and dishes_depth.sell_orders:
-            bb, ba, _, _ = self._best_bid_ask(dishes_depth)
-            spread = ba - bb
-            if spread >= 7:
-                mid = 0.5 * (bb + ba)
-                pos = int(state.position.get("ROBOT_DISHES", 0))
-                prev_ema = float(robot_ema.get("ROBOT_DISHES", mid))
-                alpha = 0.03
-                ema = alpha * mid + (1.0 - alpha) * prev_ema
-                robot_ema["ROBOT_DISHES"] = ema
-
-                dev = mid - ema
-                threshold = 34.0
-                take_cap = 4
-                buy_room = self.LIMIT - pos
-                sell_room = self.LIMIT + pos
-
-                r_orders: List[Order] = []
-                if dev > threshold and sell_room > 0:
-                    qty = min(sell_room, take_cap)
-                    if qty > 0:
-                        r_orders.append(Order("ROBOT_DISHES", bb, -qty))
-                elif dev < -threshold and buy_room > 0:
-                    qty = min(buy_room, take_cap)
-                    if qty > 0:
-                        r_orders.append(Order("ROBOT_DISHES", ba, qty))
-                else:
-                    fair = ema - 1.2 * pos
-                    r_orders = self._quote_product("ROBOT_DISHES", dishes_depth, pos, fair)
-                if r_orders:
-                    result["ROBOT_DISHES"] = r_orders
-
-        ironing_depth = state.order_depths.get("ROBOT_IRONING")
-        if ironing_depth and ironing_depth.buy_orders and ironing_depth.sell_orders:
-            bb_i, ba_i, bv_i, av_i = self._best_bid_ask(ironing_depth)
-            spread_i = ba_i - bb_i
-            if spread_i >= 7:
-                mid_i = 0.5 * (bb_i + ba_i)
-                pos_i = int(state.position.get("ROBOT_IRONING", 0))
-                prev_ie = float(robot_ema.get("ROBOT_IRONING", mid_i))
-                ie_alpha = 0.025
-                ema_i = ie_alpha * mid_i + (1.0 - ie_alpha) * prev_ie
-                robot_ema["ROBOT_IRONING"] = ema_i
-                imb_denom = float(bv_i + av_i)
-                imb = (bv_i - av_i) / imb_denom if imb_denom > 0 else 0.0
-                dev_i = mid_i - ema_i
-                buy_rm = self.LIMIT - pos_i
-                sell_rm = self.LIMIT + pos_i
-
-                ironing_orders: List[Order] = []
-                rev_thresh = 28.0
-                if dev_i > rev_thresh and sell_rm > 0:
-                    qty = min(sell_rm, 3)
-                    if qty > 0:
-                        ironing_orders.append(Order("ROBOT_IRONING", bb_i, -qty))
-                elif dev_i < -rev_thresh and buy_rm > 0:
-                    qty = min(buy_rm, 3)
-                    if qty > 0:
-                        ironing_orders.append(Order("ROBOT_IRONING", ba_i, qty))
-                elif imb > 0.24 and spread_i <= 36 and buy_rm > 0:
-                    qty = min(buy_rm, 2)
-                    if qty > 0:
-                        ironing_orders.append(Order("ROBOT_IRONING", ba_i, qty))
-                elif imb < -0.24 and spread_i <= 36 and sell_rm > 0:
-                    qty = min(sell_rm, 2)
-                    if qty > 0:
-                        ironing_orders.append(Order("ROBOT_IRONING", bb_i, -qty))
-                else:
-                    fair_i = ema_i - 1.1 * pos_i
-                    ironing_orders = self._quote_product(
-                        "ROBOT_IRONING", ironing_depth, pos_i, fair_i
-                    )
-                if ironing_orders:
-                    result["ROBOT_IRONING"] = ironing_orders
-
-        data["robot_ema"] = robot_ema
-
-        # Microchips: conservative passive MM on historically less-toxic names.
-        for product in self.MICROCHIPS:
-            depth = state.order_depths.get(product)
-            if not depth or not depth.buy_orders or not depth.sell_orders:
-                continue
-            bb, ba, _, _ = self._best_bid_ask(depth)
-            spread = ba - bb
-            if spread < 8:
-                continue
-            mid = 0.5 * (bb + ba)
-            pos = int(state.position.get(product, 0))
-            fair = mid - 1.0 * pos
-            fair += self._drift_bias(product, spread)
-            orders = self._quote_product(product, depth, pos, fair)
-            if orders:
-                result[product] = orders
-
-        # Pebbles parity fair values:
-        #   XS + S + M + L + XL ~= 50000
-        pebble_mids: Dict[str, float] = {}
-        for p in self.PEBBLES:
-            d = state.order_depths.get(p)
-            if not d or not d.buy_orders or not d.sell_orders:
-                continue
-            bb, ba, _, _ = self._best_bid_ask(d)
-            pebble_mids[p] = 0.5 * (bb + ba)
-
-        if len(pebble_mids) == len(self.PEBBLES):
-            total = sum(pebble_mids[p] for p in self.PEBBLES)
-            parity_offset = total - self.PEBBLES_PARITY
-            for p in self.PEBBLES:
-                depth = state.order_depths[p]
-                pos = int(state.position.get(p, 0))
-                pbb, pba, _, _ = self._best_bid_ask(depth)
-                fair = pebble_mids[p] - 0.20 * parity_offset
-                # Rearranged parity gives product-specific synthetic fair.
-                fair = 0.5 * fair + 0.5 * (self.PEBBLES_PARITY - (total - pebble_mids[p]))
-                fair += self._drift_bias(p, pba - pbb)
-                p_orders = self._quote_pebbles(p, depth, pos, fair, state.timestamp)
-                if p_orders:
-                    result[p] = p_orders
-
-        trader_data = self._dump_data(data)
-
-        conversions = 0
-        return result, conversions, trader_data
+        return result, 0, self._dump(data)
