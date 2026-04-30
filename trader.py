@@ -446,6 +446,12 @@ class Trader:
     _SNACK_EXTRA_PAIR_B = "SNACKPACK_PISTACHIO"
     _SNACK_EXTRA_ENTRY_Z = 2.25
     _SNACK_EXTRA_FAIR_CLIP = 4.0
+    _SNACK_RASPBERRY_PAIR_A = "SNACKPACK_STRAWBERRY"
+    _SNACK_RASPBERRY_PAIR_B = "SNACKPACK_RASPBERRY"
+    _SNACK_RASPBERRY_ALPHA = 0.0001
+    _SNACK_RASPBERRY_Z_WINDOW = 1000
+    _SNACK_RASPBERRY_ENTRY_Z = 2.0
+    _SNACK_RASPBERRY_FAIR_CLIP = 6.0
 
     def _trend_inventory_cap(self) -> int:
         """Max abs position for capped robots (mopping / ironing)."""
@@ -467,6 +473,7 @@ class Trader:
             "galaxy": {},
             "snackpair": {},
             "snackpair_extra": {},
+            "snackpair_raspberry": {},
             "robot_ema": {},
             "robot_prev_mid": {},
             "robot_zero_buf": {},
@@ -504,6 +511,7 @@ class Trader:
             "galaxy": {},
             "snackpair": {},
             "snackpair_extra": {},
+            "snackpair_raspberry": {},
             "robot_ema": {},
             "robot_prev_mid": {},
             "robot_zero_buf": {},
@@ -1143,6 +1151,51 @@ class Trader:
                         adjs[self._SNACK_EXTRA_PAIR_B] = adjs.get(self._SNACK_EXTRA_PAIR_B, 0.0) - k
 
             data["snackpair_extra"] = sp
+
+        # Notebook scan: Raspberry/Strawberry had the strongest late-notebook residual signal.
+        # Use much slower smoothing than the existing pair overlays to approximate the Kalman trend plot.
+        if self._SNACK_RASPBERRY_PAIR_A in mids and self._SNACK_RASPBERRY_PAIR_B in mids and float(mids[self._SNACK_RASPBERRY_PAIR_B]) > 0:
+            sp = data.get("snackpair_raspberry", {})
+            if not isinstance(sp, dict):
+                sp = {}
+            d = math.sqrt(float(mids[self._SNACK_RASPBERRY_PAIR_A]) / float(mids[self._SNACK_RASPBERRY_PAIR_B]))
+            prev = sp.get("d_ewma", None)
+            if prev is None:
+                d_ewma = float(d)
+            else:
+                a = float(self._SNACK_RASPBERRY_ALPHA)
+                try:
+                    d_ewma = a * float(d) + (1.0 - a) * float(prev)
+                except (TypeError, ValueError):
+                    d_ewma = float(d)
+            sp["d_ewma"] = float(d_ewma)
+
+            res = float(d) - float(d_ewma)
+            hist = sp.get("res", [])
+            if not isinstance(hist, list):
+                hist = []
+            hist.append(float(res))
+            if len(hist) > int(self._SNACK_RASPBERRY_Z_WINDOW) + 50:
+                del hist[: len(hist) - (int(self._SNACK_RASPBERRY_Z_WINDOW) + 50)]
+            sp["res"] = hist
+
+            if len(hist) >= int(self._SNACK_RASPBERRY_Z_WINDOW):
+                window = hist[-int(self._SNACK_RASPBERRY_Z_WINDOW) :]
+                mu = sum(window) / float(len(window))
+                var = sum((x - mu) ** 2 for x in window) / float(max(1, len(window) - 1))
+                sd = math.sqrt(max(1e-9, var))
+                z = (res - mu) / sd
+
+                if abs(z) >= float(self._SNACK_RASPBERRY_ENTRY_Z):
+                    k = min(float(self._SNACK_RASPBERRY_FAIR_CLIP), max(0.0, 1.8 * abs(z)))
+                    if z > 0:
+                        adjs[self._SNACK_RASPBERRY_PAIR_A] = adjs.get(self._SNACK_RASPBERRY_PAIR_A, 0.0) - k
+                        adjs[self._SNACK_RASPBERRY_PAIR_B] = adjs.get(self._SNACK_RASPBERRY_PAIR_B, 0.0) + k
+                    else:
+                        adjs[self._SNACK_RASPBERRY_PAIR_A] = adjs.get(self._SNACK_RASPBERRY_PAIR_A, 0.0) + k
+                        adjs[self._SNACK_RASPBERRY_PAIR_B] = adjs.get(self._SNACK_RASPBERRY_PAIR_B, 0.0) - k
+
+            data["snackpair_raspberry"] = sp
 
         return adjs
 
