@@ -119,7 +119,6 @@ class Trader:
         "PEBBLES_M": {"k": 2000, "th": 0.0},
         "MICROCHIP_OVAL": {"k": 1000, "th": 0.0},
         "PANEL_2X4": {"k": 2000, "th": 0.0},
-        "TRANSLATOR_GRAPHITE_MIST": {"k": 3000, "th": 0.0},
         "GALAXY_SOUNDS_BLACK_HOLES": {"k": 2000, "th": 0.0},
     }
 
@@ -162,6 +161,23 @@ class Trader:
 
     _ALPHA_TREND_LONG = frozenset({"ROBOT_MOPPING"})
 
+    TRANSLATOR_PRODUCTS = frozenset({
+        "TRANSLATOR_ASTRO_BLACK",
+        "TRANSLATOR_ECLIPSE_CHARCOAL",
+        "TRANSLATOR_GRAPHITE_MIST",
+        "TRANSLATOR_SPACE_GRAY",
+        "TRANSLATOR_VOID_BLUE",
+    })
+    TRANSLATOR_ANCHOR = frozenset({
+        "TRANSLATOR_ECLIPSE_CHARCOAL",
+        "TRANSLATOR_GRAPHITE_MIST",
+        "TRANSLATOR_SPACE_GRAY",
+    })
+    TRANSLATOR_NEAR_ANCHOR = frozenset({"TRANSLATOR_ASTRO_BLACK", "TRANSLATOR_GRAPHITE_MIST"})
+    TRANSLATOR_GRAPHITE_SCOUT = 5
+    TRANSLATOR_GRAPHITE_CONFIRM = 70.0
+    TRANSLATOR_GRAPHITE_FLAT = 90.0
+
     def _trend_inventory_cap(self) -> int:
         """Max abs position for capped robots (mopping / ironing)."""
         return min(self.LIMIT, int(self.TREND_POSITION_CAP))
@@ -176,6 +192,9 @@ class Trader:
             "open_mom_dir": {},
             "snack_prev": {},
             "dishes_mid_hist": [],
+            "translator_starts": {},
+            "translator_fast": {},
+            "translator_slow": {},
         }
         if not trader_data:
             return base
@@ -202,6 +221,9 @@ class Trader:
             "open_mom_dir": {},
             "snack_prev": {},
             "dishes_mid_hist": [],
+            "translator_starts": {},
+            "translator_fast": {},
+            "translator_slow": {},
         }
 
     def _open_mom_target(self, product: str, data: dict, mid: float) -> Optional[int]:
@@ -695,6 +717,112 @@ class Trader:
 
         return adjs
 
+    def _translator_config(self, product: str, start_mid: float) -> dict:
+        if abs(start_mid - 10000.0) <= 100.0:
+            inv = 0.0
+            if product == "TRANSLATOR_ASTRO_BLACK":
+                inv = 0.35
+            elif product == "TRANSLATOR_GRAPHITE_MIST":
+                inv = 1.20
+            return {"edge": 3, "size": 10, "inv": inv}
+        if product == "TRANSLATOR_ASTRO_BLACK":
+            return {"edge": 3, "size": 10, "inv": 0.35}
+        if product == "TRANSLATOR_VOID_BLUE":
+            return {"edge": 3, "size": 10, "inv": 0.45}
+        if product == "TRANSLATOR_ECLIPSE_CHARCOAL":
+            return {"edge": 4, "size": 6, "inv": 1.40}
+        if product == "TRANSLATOR_GRAPHITE_MIST":
+            return {"edge": 4, "size": 6, "inv": 1.00}
+        return {"edge": 4, "size": 5, "inv": 1.50}
+
+    def _translator_cross_to_target(self, product: str, depth: OrderDepth, pos: int, target: int) -> List[Order]:
+        orders: List[Order] = []
+        delta = target - pos
+        best_bid, best_ask, _, _ = self._best(depth)
+        if best_bid is None or best_ask is None:
+            return orders
+        if delta > 0:
+            avail = abs(int(depth.sell_orders.get(best_ask, 0)))
+            qty = min(delta, avail, self.LIMIT - pos)
+            if qty > 0:
+                orders.append(Order(product, best_ask, qty))
+        elif delta < 0:
+            avail = int(depth.buy_orders.get(best_bid, 0))
+            qty = min(-delta, avail, self.LIMIT + pos)
+            if qty > 0:
+                orders.append(Order(product, best_bid, -qty))
+        return orders
+
+    def _translator_passive_quotes(self, product: str, depth: OrderDepth, pos: int, fair: float, cfg: dict) -> List[Order]:
+        edge = int(cfg["edge"])
+        size = int(cfg["size"])
+        orders: List[Order] = []
+        best_bid, best_ask, _, _ = self._best(depth)
+        if best_bid is None or best_ask is None:
+            return orders
+        buy_room = self.LIMIT - pos
+        sell_room = self.LIMIT + pos
+        if buy_room > 0:
+            bid_price = min(best_bid + 1, math.floor(fair - edge))
+            if bid_price < best_ask:
+                qty = min(size, buy_room)
+                if qty > 0:
+                    orders.append(Order(product, int(bid_price), qty))
+        if sell_room > 0:
+            ask_price = max(best_ask - 1, math.ceil(fair + edge))
+            if ask_price > best_bid:
+                qty = min(size, sell_room)
+                if qty > 0:
+                    orders.append(Order(product, int(ask_price), -qty))
+        return orders
+
+    def _trade_translator(self, product: str, depth: OrderDepth, pos: int, data: dict, mid: float, fair_adj: float) -> List[Order]:
+        starts = data.setdefault("translator_starts", {})
+        fast_d = data.setdefault("translator_fast", {})
+        slow_d = data.setdefault("translator_slow", {})
+
+        starts.setdefault(product, mid)
+        start_mid = float(starts[product])
+
+        fast_mid = float(fast_d.get(product, mid))
+        slow_mid = float(slow_d.get(product, mid))
+        fast_mid = 0.96 * fast_mid + 0.04 * mid
+        slow_mid = 0.998 * slow_mid + 0.002 * mid
+        fast_d[product] = fast_mid
+        slow_d[product] = slow_mid
+
+        cfg = self._translator_config(product, start_mid)
+        orders: List[Order] = []
+        use_passive = True
+
+        if product in self.TRANSLATOR_ANCHOR and abs(start_mid - 10000.0) > 100.0:
+            target = 0
+            if product == "TRANSLATOR_GRAPHITE_MIST" and start_mid > 10250.0:
+                use_passive = False
+                if mid > start_mid + self.TRANSLATOR_GRAPHITE_FLAT:
+                    target = 0
+                elif mid < start_mid - self.TRANSLATOR_GRAPHITE_CONFIRM:
+                    target = -self.LIMIT
+                else:
+                    target = -self.TRANSLATOR_GRAPHITE_SCOUT
+            elif mid > 10250.0:
+                target = -self.LIMIT
+            elif mid < 9750.0:
+                target = self.LIMIT
+            orders.extend(self._translator_cross_to_target(product, depth, pos, target))
+        elif product in self.TRANSLATOR_NEAR_ANCHOR and abs(start_mid - 10000.0) <= 100.0:
+            signal = fast_mid - slow_mid
+            if signal > 30.0:
+                orders.extend(self._translator_cross_to_target(product, depth, pos, -self.LIMIT))
+            elif signal < -30.0:
+                orders.extend(self._translator_cross_to_target(product, depth, pos, self.LIMIT))
+
+        fair = mid - cfg["inv"] * float(pos) + fair_adj
+        exp_pos = pos + sum(o.quantity for o in orders)
+        if use_passive:
+            orders.extend(self._translator_passive_quotes(product, depth, exp_pos, fair, cfg))
+        return orders
+
     def run(self, state: TradingState):
         data = self._load(state.traderData)
         if int(data.get("last_timestamp", -1)) >= 0 and state.timestamp < int(data.get("last_timestamp", -1)):
@@ -746,6 +874,8 @@ class Trader:
                 orders = self._alpha_trend_max_long(product, depth, pos)
             elif product == "ROBOT_IRONING":
                 orders = self._alpha_trend_max_short(product, depth, pos)
+            elif product in self.TRANSLATOR_PRODUCTS:
+                orders = self._trade_translator(product, depth, pos, data, float(mid), fair_adjs.get(product, 0.0))
 
             if orders is not None:
                 if orders:
