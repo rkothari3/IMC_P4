@@ -6,6 +6,133 @@ from typing import Dict, List, Optional, Tuple
 from datamodel import Order, OrderDepth, Symbol, TradingState
 
 
+class GalaxyPairsModule:
+    PAIRS = (
+        ("dmbh", "GALAXY_SOUNDS_DARK_MATTER", "GALAXY_SOUNDS_BLACK_HOLES", 3000, 3000, 2.50),
+        ("swsf", "GALAXY_SOUNDS_SOLAR_WINDS", "GALAXY_SOUNDS_SOLAR_FLAMES", 1500, 1500, 3.00),
+    )
+    TARGET_SIZE = 10
+    POSITION_LIMIT = 10
+
+    def _clean_history(self, raw, limit: int) -> list:
+        if not isinstance(raw, list):
+            return []
+        out = []
+        for v in raw[-limit:]:
+            try:
+                out.append(int(v))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _rolling_z(self, history: list, current: int, window: int, min_hist: int):
+        lb = history[-window:]
+        if len(lb) < min_hist:
+            return None
+        mu = sum(lb) / len(lb)
+        var = max(0.0, sum(v * v for v in lb) / len(lb) - mu * mu)
+        std = math.sqrt(var)
+        return None if std <= 0.0 else (current - mu) / std
+
+    def _cross(self, product: str, od: OrderDepth, pos: int, target: int) -> list:
+        orders = []
+        target = max(-self.POSITION_LIMIT, min(self.POSITION_LIMIT, target))
+        delta = target - pos
+        if delta == 0:
+            return orders
+        best_bid = max(od.buy_orders) if od.buy_orders else None
+        best_ask = min(od.sell_orders) if od.sell_orders else None
+        if delta > 0:
+            if best_ask is None:
+                return orders
+            qty = min(delta, max(0, -od.sell_orders.get(best_ask, 0)), max(0, self.POSITION_LIMIT - pos))
+            if qty > 0:
+                orders.append(Order(product, best_ask, qty))
+        else:
+            if best_bid is None:
+                return orders
+            qty = min(-delta, max(0, od.buy_orders.get(best_bid, 0)), max(0, self.POSITION_LIMIT + pos))
+            if qty > 0:
+                orders.append(Order(product, best_bid, -qty))
+        return orders
+
+    def load_state(self, raw: dict):
+        histories = {name: [] for name, *_ in self.PAIRS}
+        targets = {name: 0 for name, *_ in self.PAIRS}
+        if not isinstance(raw, dict):
+            return histories, targets
+        h = raw.get("h", {})
+        if isinstance(h, dict):
+            for name, _, _, window, _, _ in self.PAIRS:
+                histories[name] = self._clean_history(h.get(name, []), window)
+        t = raw.get("t", {})
+        if isinstance(t, dict):
+            for name, *_ in self.PAIRS:
+                try:
+                    v = max(-self.TARGET_SIZE, min(self.TARGET_SIZE, int(t.get(name, 0))))
+                except (TypeError, ValueError):
+                    v = 0
+                targets[name] = v
+        return histories, targets
+
+    def dump_state(self, histories: dict, targets: dict) -> dict:
+        return {
+            "h": {name: histories.get(name, [])[-window:] for name, _, _, window, *_ in self.PAIRS},
+            "t": {name: int(targets.get(name, 0)) for name, *_ in self.PAIRS},
+        }
+
+    def run(self, state, histories: dict, targets: dict):
+        next_targets = {name: targets.get(name, 0) for name, *_ in self.PAIRS}
+        diffs: dict = {}
+        active = []
+
+        for name, prod_a, prod_b, window, min_hist, entry_z in self.PAIRS:
+            da = state.order_depths.get(prod_a)
+            db = state.order_depths.get(prod_b)
+            if da is None or db is None:
+                continue
+            ba = max(da.buy_orders) if da.buy_orders else None
+            aa = min(da.sell_orders) if da.sell_orders else None
+            bb = max(db.buy_orders) if db.buy_orders else None
+            ab = min(db.sell_orders) if db.sell_orders else None
+            if ba is None or aa is None or bb is None or ab is None:
+                continue
+            diff = int(round(((ba + aa) / 2.0 - (bb + ab) / 2.0) * 10))
+            history = histories[name]
+            has_min = len(history) >= min_hist
+            z = self._rolling_z(history, diff, window, min_hist)
+            prev = targets.get(name, 0)
+            if not has_min:
+                next_targets[name] = 0
+            elif z is None:
+                next_targets[name] = prev
+            elif z > entry_z:
+                next_targets[name] = -self.TARGET_SIZE
+            elif z < -entry_z:
+                next_targets[name] = self.TARGET_SIZE
+            else:
+                next_targets[name] = prev
+            diffs[name] = diff
+            active.append((name, prod_a, prod_b, window))
+
+        orders: Dict[str, list] = {}
+        for name, prod_a, prod_b, window in active:
+            tgt = next_targets[name]
+            oa = self._cross(prod_a, state.order_depths[prod_a], state.position.get(prod_a, 0), tgt)
+            ob = self._cross(prod_b, state.order_depths[prod_b], state.position.get(prod_b, 0), -tgt)
+            if oa:
+                orders[prod_a] = oa
+            if ob:
+                orders[prod_b] = ob
+            h = histories[name]
+            if name in diffs:
+                h.append(diffs[name])
+                if len(h) > window:
+                    del h[:len(h) - window]
+
+        return orders, next_targets
+
+
 class Trader:
     """
     Sleeping pods: same as trader.py (blocked LAMB_WOOL, NYLON open→close trend overlay, poly/cotton pair tilt,
@@ -99,7 +226,6 @@ class Trader:
     )
 
     BLOCKED_PRODUCTS = {
-        "GALAXY_SOUNDS_SOLAR_FLAMES",
         "PANEL_4X4",
         "PANEL_1X2",
         "ROBOT_VACUUMING",
@@ -119,7 +245,6 @@ class Trader:
         "PEBBLES_M": {"k": 2000, "th": 0.0},
         "MICROCHIP_OVAL": {"k": 1000, "th": 0.0},
         "PANEL_2X4": {"k": 2000, "th": 0.0},
-        "GALAXY_SOUNDS_BLACK_HOLES": {"k": 2000, "th": 0.0},
     }
 
     PAIRS = (
@@ -178,6 +303,8 @@ class Trader:
     TRANSLATOR_GRAPHITE_CONFIRM = 70.0
     TRANSLATOR_GRAPHITE_FLAT = 90.0
 
+    _GALAXY = GalaxyPairsModule()
+
     def _trend_inventory_cap(self) -> int:
         """Max abs position for capped robots (mopping / ironing)."""
         return min(self.LIMIT, int(self.TREND_POSITION_CAP))
@@ -195,6 +322,7 @@ class Trader:
             "translator_starts": {},
             "translator_fast": {},
             "translator_slow": {},
+            "galaxy": {},
         }
         if not trader_data:
             return base
@@ -224,6 +352,7 @@ class Trader:
             "translator_starts": {},
             "translator_fast": {},
             "translator_slow": {},
+            "galaxy": {},
         }
 
     def _open_mom_target(self, product: str, data: dict, mid: float) -> Optional[int]:
@@ -839,10 +968,19 @@ class Trader:
         fair_adjs = self._compute_fair_adjs(all_mids, data)
         result: Dict[Symbol, List[Order]] = {}
 
+        # --- Galaxy pairs ---
+        g_hist, g_tgt = self._GALAXY.load_state(data.get("galaxy", {}))
+        galaxy_orders, g_next_tgt = self._GALAXY.run(state, g_hist, g_tgt)
+        data["galaxy"] = self._GALAXY.dump_state(g_hist, g_next_tgt)
+        galaxy_handled: set = set(galaxy_orders.keys())
+        result.update(galaxy_orders)
+
         dishes_hist_in = list(data.get("dishes_mid_hist") or []) if isinstance(data.get("dishes_mid_hist"), list) else []
 
         for product in self.PRODUCTS:
             if product in self.BLOCKED_PRODUCTS:
+                continue
+            if product in galaxy_handled:
                 continue
             depth = state.order_depths.get(product)
             if depth is None:
