@@ -1,12 +1,22 @@
 import json
 import math
+from statistics import mean, stdev
 from typing import Dict, List, Optional, Tuple
 
 from datamodel import Order, OrderDepth, Symbol, TradingState
 
 
 class Trader:
+    """
+    Sleeping pods: same as trader.py (blocked LAMB_WOOL, NYLON open→close trend overlay, poly/cotton pair tilt,
+    default _trade_product for SUEDE/POLY/COTTON/NYLON).
+
+    Domestic robots: alpha stack — DISHES rolling MR blend, MOPPING aggressive long (capped), IRONING aggressive
+    short (capped), LAUNDRY MM; ROBOT_VACUUMING blocked.
+    """
+
     LIMIT = 10
+    TREND_POSITION_CAP = 8
     FAST_ALPHA = 0.18
     SLOW_ALPHA = 0.018
     VOL_ALPHA = 0.08
@@ -64,8 +74,6 @@ class Trader:
         "SNACKPACK_RASPBERRY",
     )
 
-    # Small product priors, not day labels. They are deliberately weak: they
-    # only skew quote placement until live momentum confirms or rejects them.
     STRUCTURAL_PRIOR = {
         "PEBBLES_XS": -0.35,
         "PEBBLES_S": -0.20,
@@ -94,7 +102,6 @@ class Trader:
         "GALAXY_SOUNDS_SOLAR_FLAMES",
         "PANEL_4X4",
         "PANEL_1X2",
-        "ROBOT_MOPPING",
         "ROBOT_VACUUMING",
         "SLEEP_POD_LAMB_WOOL",
     }
@@ -107,7 +114,6 @@ class Trader:
         "OXYGEN_SHAKE_GARLIC": {"threshold": 800.0, "min_ticks": 0},
     }
 
-    # Decide-once daily overlay: at tick k, compare mid to open; then hold +/-LIMIT.
     OPEN_MOM_OVERLAY = {
         "PEBBLES_XL": {"k": 1500, "th": 0.0},
         "PEBBLES_M": {"k": 2000, "th": 0.0},
@@ -117,7 +123,6 @@ class Trader:
         "GALAXY_SOUNDS_BLACK_HOLES": {"k": 2000, "th": 0.0},
     }
 
-    # Pair trading (quote tilting only): (leader a, follower b, window, lag, entry_z, weight)
     PAIRS = (
         ("UV_VISOR_AMBER", "PEBBLES_XS", 200, 20, 1.7, 0.85),
         ("MICROCHIP_OVAL", "ROBOT_IRONING", 200, 20, 1.7, 0.60),
@@ -126,27 +131,40 @@ class Trader:
     )
     PAIR_MAX_WINDOW = max(w + lag for _, _, w, lag, _, _ in PAIRS)
 
-    # OLS residual fair-value adjustments (signed clip toward predicted fair).
-    # Excludes MICROCHIP_SQUARE/OVAL (our TREND/OPEN_MOM handles those better).
     MICRO_OLS = {
         "MICROCHIP_CIRCLE":    (14328.038892, {"MICROCHIP_OVAL": -0.2144216226, "MICROCHIP_RECTANGLE":  0.1239698234, "MICROCHIP_SQUARE": -0.1626194856, "MICROCHIP_TRIANGLE": -0.2303292061}, 6.0),
         "MICROCHIP_RECTANGLE": (12595.888647, {"MICROCHIP_CIRCLE":  0.1056072980, "MICROCHIP_OVAL":       0.2521946893, "MICROCHIP_SQUARE": -0.2712089572, "MICROCHIP_TRIANGLE": -0.3316449080}, 6.0),
         "MICROCHIP_TRIANGLE":  ( 8897.550320, {"MICROCHIP_CIRCLE": -0.1771853113, "MICROCHIP_OVAL":       0.5638225952, "MICROCHIP_RECTANGLE": -0.2994843207, "MICROCHIP_SQUARE":  0.0312598043}, 6.0),
         "ROBOT_IRONING":       (18545.658868, {"ROBOT_VACUUMING":   0.1213313931, "ROBOT_MOPPING":       -0.6035255162, "ROBOT_DISHES":      -0.4402725705, "ROBOT_LAUNDRY":      0.0156519013}, 6.0),
     }
-    # UV intra-cluster OLS sign (clip ±2.5 toward predicted intra-UV fair).
+
     UV_OLS = {
         "UV_VISOR_RED":    (27273.019104, {"UV_VISOR_YELLOW": -0.3820067579, "UV_VISOR_AMBER": -0.6817909920, "UV_VISOR_ORANGE": -0.1361414455, "UV_VISOR_MAGENTA": -0.4688981022}, 2.5),
         "UV_VISOR_YELLOW": (25282.300224, {"UV_VISOR_AMBER":  -0.4210596715, "UV_VISOR_ORANGE": -0.2513172083, "UV_VISOR_RED":   -0.8739096888, "UV_VISOR_MAGENTA":  0.1165551453}, 2.5),
         "UV_VISOR_MAGENTA":(19824.977619, {"UV_VISOR_YELLOW":  0.0312302762, "UV_VISOR_AMBER": -0.6565830083, "UV_VISOR_ORANGE": -0.0653029897, "UV_VISOR_RED":     -0.2874209085}, 2.5),
     }
-    # UV prices move opposite to SNACK group (capped at ±5 per tick).
+
     UV_SNACK_COEFFS = {
         "UV_VISOR_RED":    -1.02,
         "UV_VISOR_YELLOW": -1.10,
         "UV_VISOR_MAGENTA":-1.25,
     }
     SNACK_PRODUCTS = ("SNACKPACK_CHOCOLATE", "SNACKPACK_VANILLA", "SNACKPACK_PISTACHIO", "SNACKPACK_STRAWBERRY", "SNACKPACK_RASPBERRY")
+
+    ROBOT_MR_DISH_WINDOW = 100
+    ROBOT_MR_DISH_CAP = 1000
+    DISH_MR_TRADE = 4
+    DISH_MR_BAND = 0.53
+    # Floor σ for z-score to avoid exploding signals when dispersion is negligible.
+    DISH_SIGMA_FLOOR = 22.0
+    # Extreme intraday dispersion: backbone MM only (reduces spike risk on DISHES).
+    DISH_MR_MAX_SIGMA = 300.0
+
+    _ALPHA_TREND_LONG = frozenset({"ROBOT_MOPPING"})
+
+    def _trend_inventory_cap(self) -> int:
+        """Max abs position for capped robots (mopping / ironing)."""
+        return min(self.LIMIT, int(self.TREND_POSITION_CAP))
 
     def _load(self, trader_data: str) -> dict:
         base = {
@@ -157,6 +175,7 @@ class Trader:
             "pair_z": {},
             "open_mom_dir": {},
             "snack_prev": {},
+            "dishes_mid_hist": [],
         }
         if not trader_data:
             return base
@@ -166,10 +185,24 @@ class Trader:
                 base.update(raw)
         except Exception:
             pass
+        if not isinstance(base.get("dishes_mid_hist"), list):
+            base["dishes_mid_hist"] = []
         return base
 
     def _dump(self, data: dict) -> str:
         return json.dumps(data, separators=(",", ":"))
+
+    def _reset_data(self, state_timestamp: int) -> dict:
+        return {
+            "last_timestamp": state_timestamp,
+            "state": {},
+            "mid_hist": {},
+            "kalman": {},
+            "pair_z": {},
+            "open_mom_dir": {},
+            "snack_prev": {},
+            "dishes_mid_hist": [],
+        }
 
     def _open_mom_target(self, product: str, data: dict, mid: float) -> Optional[int]:
         cfg = self.OPEN_MOM_OVERLAY.get(product)
@@ -250,7 +283,6 @@ class Trader:
             denom = max(6.0, 5.0 * vol)
             scores[product] = max(-3.0, min(3.0, trend / denom))
 
-            # Maintain mid history for pair stats.
             h = mid_hist.get(product)
             if not isinstance(h, list):
                 h = []
@@ -259,7 +291,6 @@ class Trader:
                 del h[: len(h) - (int(self.PAIR_MAX_WINDOW) + 5)]
             mid_hist[product] = h
 
-            # Kalman filter stabilizer (latent fair value).
             krec = kalman.get(product)
             if not (isinstance(krec, list) and len(krec) == 2):
                 x, P = float(mid), 1.0
@@ -278,7 +309,6 @@ class Trader:
             if follower in scores and abs(leader_score) > 0.35:
                 scores[follower] = max(-3.0, min(3.0, scores[follower] + 0.45 * sign * leader_score))
 
-        # Pair z-scores and quote tilting.
         pair_z = {}
         for a, b, w, lag, entry_z, weight in self.PAIRS:
             ha = mid_hist.get(a, [])
@@ -290,16 +320,16 @@ class Trader:
             spreads = []
             for i in range(w):
                 spreads.append(float(hb[-1 - i]) - float(ha[-1 - i - lag]))
-            mean = sum(spreads) / float(w)
-            var = sum((s - mean) ** 2 for s in spreads) / float(max(1, w - 1))
+            mean_sp = sum(spreads) / float(w)
+            var = sum((s - mean_sp) ** 2 for s in spreads) / float(max(1, w - 1))
             sd = math.sqrt(max(1e-6, var))
             cur = float(hb[-1]) - float(ha[-1 - lag])
-            z = (cur - mean) / sd
+            z_pair = (cur - mean_sp) / sd
             key = f"{a}|{b}"
-            pair_z[key] = float(z)
+            pair_z[key] = float(z_pair)
 
-            if abs(z) >= float(entry_z):
-                adj = float(weight) * max(-2.2, min(2.2, float(z)))
+            if abs(z_pair) >= float(entry_z):
+                adj = float(weight) * max(-2.2, min(2.2, float(z_pair)))
                 if a in scores:
                     scores[a] = max(-3.0, min(3.0, float(scores[a]) + adj))
                 if b in scores:
@@ -319,7 +349,6 @@ class Trader:
         inventory_skew = 0.28 * pos
         signal_shift = max(-4.0, min(4.0, 1.15 * score + prior))
         imbalance_shift = max(-2.0, min(2.0, (bid_vol - ask_vol) / max(1, bid_vol + ask_vol) * spread * 0.35))
-        # Blend in Kalman fair lightly as a stabilizer (prevents fair from snapping).
         return 0.52 * mid + 0.43 * micro + 0.05 * float(kalman_x) + signal_shift + imbalance_shift - inventory_skew
 
     def _base_size(self, product: str, spread: int, score: float, favored: bool) -> int:
@@ -364,6 +393,203 @@ class Trader:
         if move < -threshold:
             return -self.LIMIT
         return 0
+
+    def _sweep_buy_asks(
+        self, product: str, depth: OrderDepth, pos: int, room: int
+    ) -> Tuple[List[Order], int]:
+        """Lift every ask until room exhausted; returns orders and simulated end position."""
+        orders: List[Order] = []
+        p = pos
+        remaining = room
+        if remaining <= 0:
+            return orders, p
+
+        asks = sorted((int(px), abs(int(depth.sell_orders[px]))) for px in depth.sell_orders)
+        for ap, avol in asks:
+            if remaining <= 0:
+                break
+            take = min(remaining, avol)
+            if take > 0:
+                orders.append(Order(product, ap, take))
+                p += take
+                remaining -= take
+        return orders, p
+
+    def _clip_orders_to_position_limit(
+        self, product: str, pos: int, orders: List[Order]
+    ) -> List[Order]:
+        """
+        Prosperity rejects *all* orders for a product if aggregate buy (sell) qty would exceed
+        the position limit if fully matched. Multi-level sweeps + passive legs must stay inside
+        buy_room / sell_room when applied in sequence (simulated fill order = list order).
+        """
+        if not orders:
+            return []
+        lim = self.LIMIT
+        cur = pos
+        out: List[Order] = []
+        for o in orders:
+            q = int(o.quantity)
+            if q > 0:
+                room = lim - cur
+                if room <= 0:
+                    continue
+                take = min(q, room)
+                if take > 0:
+                    out.append(Order(product, int(o.price), take))
+                    cur += take
+            elif q < 0:
+                room = cur + lim
+                if room <= 0:
+                    continue
+                take = min(-q, room)
+                if take > 0:
+                    out.append(Order(product, int(o.price), -take))
+                    cur -= take
+        return out
+
+    def _sweep_sell_bids(
+        self, product: str, depth: OrderDepth, pos: int, room: int
+    ) -> Tuple[List[Order], int]:
+        """Hit every bid selling until room exhausted (room = max contracts we can sell from position)."""
+        orders: List[Order] = []
+        p = pos
+        remaining = room
+        if remaining <= 0:
+            return orders, p
+
+        bids = sorted(
+            ((int(px), int(depth.buy_orders[px])) for px in depth.buy_orders),
+            key=lambda t: t[0],
+            reverse=True,
+        )
+        for bp, bvol in bids:
+            if remaining <= 0:
+                break
+            take = min(remaining, bvol)
+            if take > 0:
+                orders.append(Order(product, bp, -take))
+                p -= take
+                remaining -= take
+        return orders, p
+
+    def _alpha_trend_max_long(self, product: str, depth: OrderDepth, pos: int) -> List[Order]:
+        """ROBOT_MOPPING only: sweep asks then passive bid; cap = TREND_POSITION_CAP."""
+        target = self._trend_inventory_cap()
+        room = target - pos
+        if room <= 0:
+            return []
+
+        orders, np = self._sweep_buy_asks(product, depth, pos, room)
+        still = target - np
+        if still <= 0:
+            return orders
+
+        best_bid, best_ask, _, _ = self._best(depth)
+        if best_bid is None:
+            return orders
+        passive_px = best_bid + 1
+        if best_ask is not None:
+            passive_px = min(passive_px, best_ask - 1)
+        if passive_px > best_bid and still > 0:
+            orders.append(Order(product, int(passive_px), still))
+
+        return orders
+
+    def _alpha_trend_max_short(self, product: str, depth: OrderDepth, pos: int) -> List[Order]:
+        """Aggressive short capped at -_trend_inventory_cap(); symmetric to long."""
+        target = -self._trend_inventory_cap()
+        room = pos - target
+        if room <= 0:
+            return []
+
+        orders, np = self._sweep_sell_bids(product, depth, pos, room)
+        still = np - target
+        if still <= 0:
+            return orders
+
+        best_bid, best_ask, _, _ = self._best(depth)
+        if best_ask is None:
+            return orders
+        passive_px = best_ask - 1
+        if best_bid is not None:
+            passive_px = max(passive_px, best_bid + 1)
+        if passive_px < best_ask and still > 0:
+            orders.append(Order(product, int(passive_px), -still))
+
+        return orders
+
+    def _trade_dishes_risk_managed(
+        self,
+        depth: OrderDepth,
+        mid: float,
+        pos: int,
+        hist: List[float],
+        score: float,
+        kalman_x: float,
+        fair_adj: float,
+    ) -> Tuple[List[Order], List[float]]:
+        """
+        Rolling 100-bar MR when signal is decisive and dispersion is bounded; σ floor on denominator;
+        wide window σ → backbone MM only (avoids pathology when MR would dominate).
+
+        Near mean (inside band): full backbone quoting. MR sweeps gated by capped trade size DISH_MR_TRADE.
+        """
+        prod = "ROBOT_DISHES"
+        h = list(hist)
+        h.append(float(mid))
+        if len(h) > self.ROBOT_MR_DISH_CAP:
+            del h[: len(h) - self.ROBOT_MR_DISH_CAP]
+
+        win = self.ROBOT_MR_DISH_WINDOW
+        tc = min(self.DISH_MR_TRADE, self.LIMIT)
+        band = self.DISH_MR_BAND
+
+        def backbone() -> List[Order]:
+            return self._trade_product(prod, depth, pos, score, None, kalman_x, fair_adj)
+
+        if len(h) < win:
+            return backbone(), h
+
+        window = h[-win:]
+        mu = mean(window)
+        sigma_raw = stdev(window) if len(window) >= 2 else 0.0
+
+        # Very spiky residual window: backbone only (risk control).
+        if sigma_raw > float(self.DISH_MR_MAX_SIGMA):
+            return backbone(), h
+
+        sigma_eff = max(float(sigma_raw), float(self.DISH_SIGMA_FLOOR))
+        z = (float(mid) - mu) / sigma_eff
+
+        if abs(z) <= band:
+            return backbone(), h
+
+        orders: List[Order] = []
+        if z < -band:
+            delta = min(tc - pos, self.LIMIT - pos)
+            if delta <= 0:
+                return backbone(), h
+            sweep, _ = self._sweep_buy_asks(prod, depth, pos, delta)
+            best_bid, best_ask, _, _ = self._best(depth)
+            if sweep:
+                orders.extend(sweep)
+            elif best_ask is not None:
+                orders.append(Order(prod, int(best_ask), delta))
+            return orders, h
+
+        want = -tc
+        delta = min(pos - want, pos + self.LIMIT)
+        if delta <= 0:
+            return backbone(), h
+        sweep, _ = self._sweep_sell_bids(prod, depth, pos, delta)
+        best_bid, _, _, _ = self._best(depth)
+        if sweep:
+            orders.extend(sweep)
+        elif best_bid is not None:
+            orders.append(Order(prod, int(best_bid), -delta))
+
+        return orders, h
 
     def _trade_product(self, product: str, depth: OrderDepth, pos: int, score: float, trend_target: Optional[int], kalman_x: float, fair_adj: float = 0.0) -> List[Order]:
         orders: List[Order] = []
@@ -413,8 +639,6 @@ class Trader:
         if spread < 3 or best_bid + 1 >= best_ask:
             return orders
 
-        # Passive quotes are the core live-safe edge. The fair-value shift and
-        # inventory skew decide which side we quote more aggressively.
         bid_price = min(best_bid + 1, best_ask - 1, math.floor(fair - 0.35))
         ask_price = max(best_ask - 1, best_bid + 1, math.ceil(fair + 0.35))
         if bid_price >= ask_price:
@@ -474,15 +698,7 @@ class Trader:
     def run(self, state: TradingState):
         data = self._load(state.traderData)
         if int(data.get("last_timestamp", -1)) >= 0 and state.timestamp < int(data.get("last_timestamp", -1)):
-            data = {
-                "last_timestamp": state.timestamp,
-                "state": {},
-                "mid_hist": {},
-                "kalman": {},
-                "pair_z": {},
-                "open_mom_dir": {},
-                "snack_prev": {},
-            }
+            data = self._reset_data(state.timestamp)
         data["last_timestamp"] = state.timestamp
 
         all_mids: Dict[str, float] = {}
@@ -495,6 +711,8 @@ class Trader:
         fair_adjs = self._compute_fair_adjs(all_mids, data)
         result: Dict[Symbol, List[Order]] = {}
 
+        dishes_hist_in = list(data.get("dishes_mid_hist") or []) if isinstance(data.get("dishes_mid_hist"), list) else []
+
         for product in self.PRODUCTS:
             if product in self.BLOCKED_PRODUCTS:
                 continue
@@ -502,14 +720,46 @@ class Trader:
             if depth is None:
                 continue
             mid = self._mid(depth)
+            pos = int(state.position.get(product, 0))
+
+            orders: Optional[List[Order]] = None
+
+            if mid is None:
+                continue
+
             krec = data.get("kalman", {}).get(product)
-            kalman_x = float(krec[0]) if isinstance(krec, list) and len(krec) == 2 else (float(mid) if mid is not None else 0.0)
+            kalman_x = float(krec[0]) if isinstance(krec, list) and len(krec) == 2 else float(mid)
+
+            if product == "ROBOT_DISHES":
+                od, new_hist = self._trade_dishes_risk_managed(
+                    depth,
+                    float(mid),
+                    pos,
+                    dishes_hist_in,
+                    float(scores.get(product, 0.0)),
+                    float(kalman_x),
+                    fair_adjs.get(product, 0.0),
+                )
+                dishes_hist_in = new_hist
+                orders = od
+            elif product in self._ALPHA_TREND_LONG:
+                orders = self._alpha_trend_max_long(product, depth, pos)
+            elif product == "ROBOT_IRONING":
+                orders = self._alpha_trend_max_short(product, depth, pos)
+
+            if orders is not None:
+                if orders:
+                    clipped = self._clip_orders_to_position_limit(product, pos, orders)
+                    if clipped:
+                        result[product] = clipped
+                continue
+
             open_mom_target = self._open_mom_target(product, data, float(mid)) if mid is not None else None
             if open_mom_target is not None:
                 trend_target = int(open_mom_target)
             else:
                 trend_target = self._trend_target(product, data, float(mid)) if mid is not None else None
-            orders = self._trade_product(
+            default_orders = self._trade_product(
                 product,
                 depth,
                 int(state.position.get(product, 0)),
@@ -518,7 +768,13 @@ class Trader:
                 float(kalman_x),
                 fair_adjs.get(product, 0.0),
             )
-            if orders:
-                result[product] = orders
+            if default_orders:
+                clipped = self._clip_orders_to_position_limit(
+                    product, int(state.position.get(product, 0)), default_orders
+                )
+                if clipped:
+                    result[product] = clipped
+
+        data["dishes_mid_hist"] = dishes_hist_in
 
         return result, 0, self._dump(data)

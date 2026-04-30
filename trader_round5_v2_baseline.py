@@ -92,6 +92,8 @@ class Trader:
 
     BLOCKED_PRODUCTS = {
         "GALAXY_SOUNDS_SOLAR_FLAMES",
+        "MICROCHIP_TRIANGLE",
+        "UV_VISOR_MAGENTA",
         "PANEL_4X4",
         "PANEL_1X2",
         "ROBOT_MOPPING",
@@ -126,28 +128,6 @@ class Trader:
     )
     PAIR_MAX_WINDOW = max(w + lag for _, _, w, lag, _, _ in PAIRS)
 
-    # OLS residual fair-value adjustments (signed clip toward predicted fair).
-    # Excludes MICROCHIP_SQUARE/OVAL (our TREND/OPEN_MOM handles those better).
-    MICRO_OLS = {
-        "MICROCHIP_CIRCLE":    (14328.038892, {"MICROCHIP_OVAL": -0.2144216226, "MICROCHIP_RECTANGLE":  0.1239698234, "MICROCHIP_SQUARE": -0.1626194856, "MICROCHIP_TRIANGLE": -0.2303292061}, 6.0),
-        "MICROCHIP_RECTANGLE": (12595.888647, {"MICROCHIP_CIRCLE":  0.1056072980, "MICROCHIP_OVAL":       0.2521946893, "MICROCHIP_SQUARE": -0.2712089572, "MICROCHIP_TRIANGLE": -0.3316449080}, 6.0),
-        "MICROCHIP_TRIANGLE":  ( 8897.550320, {"MICROCHIP_CIRCLE": -0.1771853113, "MICROCHIP_OVAL":       0.5638225952, "MICROCHIP_RECTANGLE": -0.2994843207, "MICROCHIP_SQUARE":  0.0312598043}, 6.0),
-        "ROBOT_IRONING":       (18545.658868, {"ROBOT_VACUUMING":   0.1213313931, "ROBOT_MOPPING":       -0.6035255162, "ROBOT_DISHES":      -0.4402725705, "ROBOT_LAUNDRY":      0.0156519013}, 6.0),
-    }
-    # UV intra-cluster OLS sign (clip ±2.5 toward predicted intra-UV fair).
-    UV_OLS = {
-        "UV_VISOR_RED":    (27273.019104, {"UV_VISOR_YELLOW": -0.3820067579, "UV_VISOR_AMBER": -0.6817909920, "UV_VISOR_ORANGE": -0.1361414455, "UV_VISOR_MAGENTA": -0.4688981022}, 2.5),
-        "UV_VISOR_YELLOW": (25282.300224, {"UV_VISOR_AMBER":  -0.4210596715, "UV_VISOR_ORANGE": -0.2513172083, "UV_VISOR_RED":   -0.8739096888, "UV_VISOR_MAGENTA":  0.1165551453}, 2.5),
-        "UV_VISOR_MAGENTA":(19824.977619, {"UV_VISOR_YELLOW":  0.0312302762, "UV_VISOR_AMBER": -0.6565830083, "UV_VISOR_ORANGE": -0.0653029897, "UV_VISOR_RED":     -0.2874209085}, 2.5),
-    }
-    # UV prices move opposite to SNACK group (capped at ±5 per tick).
-    UV_SNACK_COEFFS = {
-        "UV_VISOR_RED":    -1.02,
-        "UV_VISOR_YELLOW": -1.10,
-        "UV_VISOR_MAGENTA":-1.25,
-    }
-    SNACK_PRODUCTS = ("SNACKPACK_CHOCOLATE", "SNACKPACK_VANILLA", "SNACKPACK_PISTACHIO", "SNACKPACK_STRAWBERRY", "SNACKPACK_RASPBERRY")
-
     def _load(self, trader_data: str) -> dict:
         base = {
             "last_timestamp": -1,
@@ -156,7 +136,6 @@ class Trader:
             "kalman": {},
             "pair_z": {},
             "open_mom_dir": {},
-            "snack_prev": {},
         }
         if not trader_data:
             return base
@@ -365,7 +344,7 @@ class Trader:
             return -self.LIMIT
         return 0
 
-    def _trade_product(self, product: str, depth: OrderDepth, pos: int, score: float, trend_target: Optional[int], kalman_x: float, fair_adj: float = 0.0) -> List[Order]:
+    def _trade_product(self, product: str, depth: OrderDepth, pos: int, score: float, trend_target: Optional[int], kalman_x: float) -> List[Order]:
         orders: List[Order] = []
         best_bid, best_ask, bid_vol, ask_vol = self._best(depth)
         if best_bid is None or best_ask is None:
@@ -388,7 +367,7 @@ class Trader:
                 return orders
 
         prior = float(self.STRUCTURAL_PRIOR.get(product, 0.0))
-        fair = self._micro_fair(depth, mid, score, prior, pos, float(kalman_x)) + fair_adj
+        fair = self._micro_fair(depth, mid, score, prior, pos, float(kalman_x))
 
         buy_room = self.LIMIT - pos
         sell_room = self.LIMIT + pos
@@ -442,35 +421,6 @@ class Trader:
 
         return orders
 
-    def _compute_fair_adjs(self, mids: Dict[str, float], data: dict) -> Dict[str, float]:
-        adjs: Dict[str, float] = {}
-
-        for product, (intercept, coefs, clip) in self.MICRO_OLS.items():
-            if product not in mids or not all(o in mids for o in coefs):
-                continue
-            predicted = intercept + sum(c * mids[o] for o, c in coefs.items())
-            diff = predicted - mids[product]
-            adjs[product] = clip if diff > 0 else (-clip if diff < 0 else 0.0)
-
-        for product, (intercept, coefs, clip) in self.UV_OLS.items():
-            if product not in mids or not all(o in mids for o in coefs):
-                continue
-            predicted = intercept + sum(c * mids[o] for o, c in coefs.items())
-            diff = predicted - mids[product]
-            adjs[product] = adjs.get(product, 0.0) + (clip if diff > 0 else (-clip if diff < 0 else 0.0))
-
-        snack_prev = data.get("snack_prev") or {}
-        snack_cur  = [mids[p] for p in self.SNACK_PRODUCTS if p in mids]
-        snack_prv  = [float(snack_prev[p]) for p in self.SNACK_PRODUCTS if p in mids and p in snack_prev]
-        if snack_cur and len(snack_prv) == len(snack_cur):
-            delta = sum(snack_cur) / len(snack_cur) - sum(snack_prv) / len(snack_prv)
-            for product, coeff in self.UV_SNACK_COEFFS.items():
-                if product in mids:
-                    adjs[product] = adjs.get(product, 0.0) + max(-5.0, min(5.0, coeff * delta))
-        data["snack_prev"] = {p: mids[p] for p in self.SNACK_PRODUCTS if p in mids}
-
-        return adjs
-
     def run(self, state: TradingState):
         data = self._load(state.traderData)
         if int(data.get("last_timestamp", -1)) >= 0 and state.timestamp < int(data.get("last_timestamp", -1)):
@@ -481,18 +431,10 @@ class Trader:
                 "kalman": {},
                 "pair_z": {},
                 "open_mom_dir": {},
-                "snack_prev": {},
             }
         data["last_timestamp"] = state.timestamp
 
-        all_mids: Dict[str, float] = {}
-        for _prod, _depth in state.order_depths.items():
-            _m = self._mid(_depth)
-            if _m is not None:
-                all_mids[_prod] = _m
-
         scores = self._update_features(state, data)
-        fair_adjs = self._compute_fair_adjs(all_mids, data)
         result: Dict[Symbol, List[Order]] = {}
 
         for product in self.PRODUCTS:
@@ -516,7 +458,6 @@ class Trader:
                 float(scores.get(product, 0.0)),
                 trend_target,
                 float(kalman_x),
-                fair_adjs.get(product, 0.0),
             )
             if orders:
                 result[product] = orders
