@@ -1525,7 +1525,12 @@ class Trader:
         g_hist, g_tgt = self._GALAXY.load_state(data.get("galaxy", {}))
         galaxy_orders, g_next_tgt = self._GALAXY.run(state, g_hist, g_tgt)
         data["galaxy"] = self._GALAXY.dump_state(g_hist, g_next_tgt)
-        galaxy_handled: set = set(galaxy_orders.keys())
+        active_galaxy_products = set()
+        for name, prod_a, prod_b, *_ in self._GALAXY.PAIRS:
+            if int(g_next_tgt.get(name, 0)) != 0:
+                active_galaxy_products.add(prod_a)
+                active_galaxy_products.add(prod_b)
+        galaxy_handled: set = set(galaxy_orders.keys()) | active_galaxy_products
         result.update(galaxy_orders)
 
         dishes_hist_in = list(data.get("dishes_mid_hist") or []) if isinstance(data.get("dishes_mid_hist"), list) else []
@@ -1551,6 +1556,8 @@ class Trader:
             kalman_x = float(krec[0]) if isinstance(krec, list) and len(krec) == 2 else float(mid)
             if product in self.ROBOT_SNIPPET_PRODUCTS:
                 orders = self._trade_robot_snippet(product, depth, pos, data)
+            elif product.startswith("GALAXY_SOUNDS_"):
+                orders = self._simple_mm(product, depth, pos)
             elif product in self.SLEEP_SPECIALIST_PRODUCTS:
                 orders = self._trade_sleep_specialist(product, depth, pos, sleep_pod_mids)
             elif product == "ROBOT_DISHES":
