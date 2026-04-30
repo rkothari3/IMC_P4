@@ -294,6 +294,37 @@ class Trader:
     _ALPHA_TREND_LONG = frozenset({"ROBOT_MOPPING", "SLEEP_POD_SUEDE", "SLEEP_POD_POLYESTER"})
     _SIMPLE_MM_PRODUCTS = frozenset({"SLEEP_POD_LAMB_WOOL", "SLEEP_POD_NYLON", "ROBOT_VACUUMING", "ROBOT_LAUNDRY"})
 
+    PEBBLE_SPECIALIST_PRODUCTS = frozenset({
+        "PEBBLES_XS",
+        "PEBBLES_S",
+        "PEBBLES_M",
+        "PEBBLES_L",
+        "PEBBLES_XL",
+    })
+    PEBBLE_XS_M = -0.1588
+    PEBBLE_XS_EXIT_THRESHOLD = -400.0
+    PEBBLE_XS_LONG_THRESHOLD = -750.0
+    PEBBLE_XS_SHORT_RE_ENTRY_THRESHOLD = -200.0
+    PEBBLE_S_M = -0.0860
+    PEBBLE_S_NEUTRAL_BAND = 100.0
+    PEBBLE_S_DEAD_ZONE = 200.0
+    PEBBLE_S_SCALE = 500.0
+    PEBBLE_S_POSITION_OFFSET = -3
+    PEBBLE_M_ANCHOR = 10000.0
+    PEBBLE_M_NEUTRAL_BAND = 100.0
+    PEBBLE_M_DEAD_ZONE = 300.0
+    PEBBLE_M_SCALE = 1250.0
+    PEBBLE_L_ANCHOR = 10000.0
+    PEBBLE_L_NEUTRAL_BAND = 100.0
+    PEBBLE_L_DEAD_ZONE = 300.0
+    PEBBLE_L_SCALE = 1250.0
+    PEBBLE_XL_WEIGHTS = {
+        "PEBBLES_XS": 1.0,
+        "PEBBLES_S": 1.0,
+        "PEBBLES_M": 0.5,
+        "PEBBLES_L": 0.5,
+    }
+
     SLEEP_SPECIALIST_PRODUCTS = frozenset({
         "SLEEP_POD_POLYESTER",
         "SLEEP_POD_SUEDE",
@@ -417,6 +448,7 @@ class Trader:
             "robot_ema": {},
             "robot_prev_mid": {},
             "robot_zero_buf": {},
+            "pebbles": {},
         }
         if not trader_data:
             return base
@@ -452,6 +484,7 @@ class Trader:
             "robot_ema": {},
             "robot_prev_mid": {},
             "robot_zero_buf": {},
+            "pebbles": {},
         }
 
     def _open_mom_target(self, product: str, data: dict, mid: float) -> Optional[int]:
@@ -1443,6 +1476,213 @@ class Trader:
 
         return orders
 
+    @staticmethod
+    def _clip_target(target: float, limit: int) -> int:
+        return int(max(-limit, min(limit, round(target))))
+
+    def _pebble_store(self, data: dict) -> dict:
+        store = data.setdefault("pebbles", {})
+        if not isinstance(store, dict):
+            store = {}
+            data["pebbles"] = store
+        return store
+
+    def _pebble_fv_state_target(
+        self,
+        product: str,
+        mid: float,
+        pos: int,
+        store: dict,
+        slope: float,
+        exit_threshold: float,
+        long_threshold: float,
+        short_reentry_threshold: float,
+    ) -> int:
+        rec = store.setdefault(product, {})
+        if not isinstance(rec, dict):
+            rec = {}
+            store[product] = rec
+
+        t = int(rec.get("t", 0))
+        residual_sum = float(rec.get("sum", 0.0)) + float(mid) - float(slope) * float(t)
+        n = int(rec.get("n", 0)) + 1
+        intercept = residual_sum / float(max(1, n))
+        fair = float(slope) * float(t) + intercept
+
+        if t == 0:
+            target = -self.LIMIT
+        elif mid < fair + float(long_threshold):
+            target = self.LIMIT
+        elif mid < fair + float(exit_threshold) and pos <= 0:
+            target = 0
+        elif mid > fair + float(short_reentry_threshold):
+            target = -self.LIMIT
+        else:
+            target = pos
+
+        rec["t"] = t + 1
+        rec["sum"] = residual_sum
+        rec["n"] = n
+        return int(max(-self.LIMIT, min(self.LIMIT, target)))
+
+    def _pebble_s_target(self, mid: float, store: dict) -> int:
+        rec = store.setdefault("PEBBLES_S", {})
+        if not isinstance(rec, dict):
+            rec = {}
+            store["PEBBLES_S"] = rec
+
+        t = int(rec.get("t", 0))
+        residual_sum = float(rec.get("sum", 0.0)) + float(mid) - float(self.PEBBLE_S_M) * float(t)
+        n = int(rec.get("n", 0)) + 1
+        intercept = residual_sum / float(max(1, n))
+        fair = float(self.PEBBLE_S_M) * float(t) + intercept
+        residual = float(mid) - fair
+
+        side = int(rec.get("side", 0))
+        peak = float(rec.get("peak", 0.0))
+        if abs(residual) < float(self.PEBBLE_S_NEUTRAL_BAND):
+            side = 0
+            peak = 0.0
+            ratchet = 0
+        else:
+            new_side = -1 if residual > 0 else 1
+            if new_side != side:
+                side = new_side
+                peak = 0.0
+            peak = max(peak, abs(residual))
+            if peak <= float(self.PEBBLE_S_DEAD_ZONE) or self.PEBBLE_S_SCALE <= self.PEBBLE_S_DEAD_ZONE:
+                ratchet = 0
+            else:
+                mag = min((peak - float(self.PEBBLE_S_DEAD_ZONE)) / (float(self.PEBBLE_S_SCALE) - float(self.PEBBLE_S_DEAD_ZONE)), 1.0)
+                ratchet = int(round(float(side) * mag * float(self.LIMIT)))
+
+        rec["t"] = t + 1
+        rec["sum"] = residual_sum
+        rec["n"] = n
+        rec["side"] = side
+        rec["peak"] = peak
+        return int(max(-self.LIMIT, min(self.LIMIT, ratchet + int(self.PEBBLE_S_POSITION_OFFSET))))
+
+    def _pebble_anchor_target(
+        self,
+        product: str,
+        mid: float,
+        store: dict,
+        anchor: float,
+        neutral_band: float,
+        dead_zone: float,
+        scale: float,
+    ) -> int:
+        rec = store.setdefault(product, {})
+        if not isinstance(rec, dict):
+            rec = {}
+            store[product] = rec
+
+        diff = float(mid) - float(anchor)
+        side = int(rec.get("side", 0))
+        peak = float(rec.get("peak", 0.0))
+        if abs(diff) < float(neutral_band):
+            side = 0
+            peak = 0.0
+            target = 0
+        else:
+            new_side = -1 if diff > 0 else 1
+            if new_side != side:
+                side = new_side
+                peak = 0.0
+            peak = max(peak, abs(diff))
+            if peak <= float(dead_zone) or scale <= dead_zone:
+                target = 0
+            else:
+                mag = min((peak - float(dead_zone)) / (float(scale) - float(dead_zone)), 1.0)
+                target = int(round(float(side) * mag * float(self.LIMIT)))
+
+        rec["side"] = side
+        rec["peak"] = peak
+        return int(max(-self.LIMIT, min(self.LIMIT, target)))
+
+    def _pebble_specialist_targets(self, state: TradingState, data: dict) -> Dict[str, int]:
+        store = self._pebble_store(data)
+        targets: Dict[str, int] = {}
+
+        xs_depth = state.order_depths.get("PEBBLES_XS")
+        xs_mid = self._mid(xs_depth) if xs_depth is not None else None
+        if xs_mid is not None:
+            targets["PEBBLES_XS"] = self._pebble_fv_state_target(
+                "PEBBLES_XS",
+                float(xs_mid),
+                int(state.position.get("PEBBLES_XS", 0)),
+                store,
+                float(self.PEBBLE_XS_M),
+                float(self.PEBBLE_XS_EXIT_THRESHOLD),
+                float(self.PEBBLE_XS_LONG_THRESHOLD),
+                float(self.PEBBLE_XS_SHORT_RE_ENTRY_THRESHOLD),
+            )
+
+        s_depth = state.order_depths.get("PEBBLES_S")
+        s_mid = self._mid(s_depth) if s_depth is not None else None
+        if s_mid is not None:
+            targets["PEBBLES_S"] = self._pebble_s_target(float(s_mid), store)
+
+        m_depth = state.order_depths.get("PEBBLES_M")
+        m_mid = self._mid(m_depth) if m_depth is not None else None
+        if m_mid is not None:
+            targets["PEBBLES_M"] = self._pebble_anchor_target(
+                "PEBBLES_M",
+                float(m_mid),
+                store,
+                float(self.PEBBLE_M_ANCHOR),
+                float(self.PEBBLE_M_NEUTRAL_BAND),
+                float(self.PEBBLE_M_DEAD_ZONE),
+                float(self.PEBBLE_M_SCALE),
+            )
+
+        l_depth = state.order_depths.get("PEBBLES_L")
+        l_mid = self._mid(l_depth) if l_depth is not None else None
+        if l_mid is not None:
+            targets["PEBBLES_L"] = self._pebble_anchor_target(
+                "PEBBLES_L",
+                float(l_mid),
+                store,
+                float(self.PEBBLE_L_ANCHOR),
+                float(self.PEBBLE_L_NEUTRAL_BAND),
+                float(self.PEBBLE_L_DEAD_ZONE),
+                float(self.PEBBLE_L_SCALE),
+            )
+
+        if state.order_depths.get("PEBBLES_XL") is not None and targets:
+            weighted_sum = sum(float(self.PEBBLE_XL_WEIGHTS[p]) * float(t) for p, t in targets.items() if p in self.PEBBLE_XL_WEIGHTS)
+            targets["PEBBLES_XL"] = self._clip_target(-weighted_sum, self.LIMIT)
+
+        return targets
+
+    def _trade_pebble_specialist(self, product: str, depth: OrderDepth, pos: int, target: int) -> List[Order]:
+        delta = int(target) - int(pos)
+        if delta == 0:
+            return []
+
+        orders: List[Order] = []
+        if delta > 0:
+            remaining = min(delta, self.LIMIT - pos)
+            for ask_price in sorted(depth.sell_orders.keys()):
+                if remaining <= 0:
+                    break
+                qty = min(remaining, -int(depth.sell_orders[ask_price]))
+                if qty > 0:
+                    orders.append(Order(product, int(ask_price), int(qty)))
+                    remaining -= qty
+        else:
+            remaining = min(-delta, self.LIMIT + pos)
+            for bid_price in sorted(depth.buy_orders.keys(), reverse=True):
+                if remaining <= 0:
+                    break
+                qty = min(remaining, int(depth.buy_orders[bid_price]))
+                if qty > 0:
+                    orders.append(Order(product, int(bid_price), -int(qty)))
+                    remaining -= qty
+
+        return orders
+
     def _trade_cotton_reversion(self, state: TradingState, pos: int) -> List[Order]:
         prod = "SLEEP_POD_COTTON"
         depth = state.order_depths.get(prod)
@@ -1535,6 +1775,7 @@ class Trader:
 
         dishes_hist_in = list(data.get("dishes_mid_hist") or []) if isinstance(data.get("dishes_mid_hist"), list) else []
         sleep_pod_mids = self._sleep_pod_mids(state)
+        pebble_targets = self._pebble_specialist_targets(state, data)
 
         for product in self.PRODUCTS:
             if product in self.BLOCKED_PRODUCTS:
@@ -1554,7 +1795,12 @@ class Trader:
 
             krec = data.get("kalman", {}).get(product)
             kalman_x = float(krec[0]) if isinstance(krec, list) and len(krec) == 2 else float(mid)
-            if product in self.ROBOT_SNIPPET_PRODUCTS:
+            if product in self.PEBBLE_SPECIALIST_PRODUCTS:
+                if product in pebble_targets:
+                    orders = self._trade_pebble_specialist(product, depth, pos, int(pebble_targets[product]))
+                else:
+                    orders = []
+            elif product in self.ROBOT_SNIPPET_PRODUCTS:
                 orders = self._trade_robot_snippet(product, depth, pos, data)
             elif product.startswith("GALAXY_SOUNDS_"):
                 orders = self._simple_mm(product, depth, pos)
