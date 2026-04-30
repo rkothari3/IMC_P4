@@ -143,7 +143,7 @@ class Trader:
     """
 
     LIMIT = 10
-    TREND_POSITION_CAP = 8
+    TREND_POSITION_CAP = 10
     FAST_ALPHA = 0.18
     SLOW_ALPHA = 0.018
     VOL_ALPHA = 0.08
@@ -217,7 +217,6 @@ class Trader:
 
     LEAD_LAG = (
         ("UV_VISOR_AMBER", "PEBBLES_XS", 1.0),
-        ("SLEEP_POD_POLYESTER", "UV_VISOR_AMBER", -1.0),
         ("MICROCHIP_SQUARE", "SLEEP_POD_SUEDE", 1.0),
         ("MICROCHIP_OVAL", "ROBOT_IRONING", 1.0),
         ("GALAXY_SOUNDS_BLACK_HOLES", "OXYGEN_SHAKE_GARLIC", 1.0),
@@ -228,7 +227,6 @@ class Trader:
     BLOCKED_PRODUCTS = {
         "PANEL_4X4",
         "PANEL_1X2",
-        "ROBOT_VACUUMING",
         "SLEEP_POD_LAMB_WOOL",
     }
 
@@ -251,7 +249,6 @@ class Trader:
         ("UV_VISOR_AMBER", "PEBBLES_XS", 200, 20, 1.7, 0.85),
         ("MICROCHIP_OVAL", "ROBOT_IRONING", 200, 20, 1.7, 0.60),
         ("GALAXY_SOUNDS_BLACK_HOLES", "OXYGEN_SHAKE_GARLIC", 200, 20, 1.7, 0.70),
-        ("SLEEP_POD_POLYESTER", "SLEEP_POD_COTTON", 200, 5, 1.5, 0.55),
     )
     PAIR_MAX_WINDOW = max(w + lag for _, _, w, lag, _, _ in PAIRS)
 
@@ -284,7 +281,8 @@ class Trader:
     # Extreme intraday dispersion: backbone MM only (reduces spike risk on DISHES).
     DISH_MR_MAX_SIGMA = 300.0
 
-    _ALPHA_TREND_LONG = frozenset({"ROBOT_MOPPING"})
+    _ALPHA_TREND_LONG = frozenset({"ROBOT_MOPPING", "SLEEP_POD_SUEDE", "SLEEP_POD_POLYESTER"})
+    _SIMPLE_MM_PRODUCTS = frozenset({"SLEEP_POD_LAMB_WOOL", "SLEEP_POD_NYLON", "ROBOT_VACUUMING", "ROBOT_LAUNDRY"})
 
     TRANSLATOR_PRODUCTS = frozenset({
         "TRANSLATOR_ASTRO_BLACK",
@@ -787,7 +785,7 @@ class Trader:
                 buy_room += qty
                 sell_room -= qty
 
-        if spread < 3 or best_bid + 1 >= best_ask:
+        if spread < 4 or best_bid + 1 >= best_ask:
             return orders
 
         bid_price = min(best_bid + 1, best_ask - 1, math.floor(fair - 0.35))
@@ -952,6 +950,79 @@ class Trader:
             orders.extend(self._translator_passive_quotes(product, depth, exp_pos, fair, cfg))
         return orders
 
+    def _simple_mm(self, product: str, depth: OrderDepth, pos: int) -> List[Order]:
+        orders: List[Order] = []
+        best_bid, best_ask, _, _ = self._best(depth)
+        if best_bid is None or best_ask is None:
+            return orders
+        bid_price = best_bid + 1
+        ask_price = best_ask - 1
+        if bid_price >= ask_price:
+            return orders
+        buy_room = self.LIMIT - pos
+        sell_room = self.LIMIT + pos
+        if buy_room > 0:
+            orders.append(Order(product, bid_price, min(buy_room, 10)))
+        if sell_room > 0:
+            orders.append(Order(product, ask_price, -min(sell_room, 10)))
+        return orders
+
+    def _trade_cotton_reversion(self, state: TradingState, pos: int) -> List[Order]:
+        prod = "SLEEP_POD_COTTON"
+        depth = state.order_depths.get(prod)
+        if depth is None:
+            return []
+        mid = self._mid(depth)
+        if mid is None:
+            return []
+
+        cluster_prods = ("SLEEP_POD_SUEDE", "SLEEP_POD_LAMB_WOOL", "SLEEP_POD_POLYESTER", "SLEEP_POD_NYLON")
+        cluster_mids = []
+        for p in cluster_prods:
+            d = state.order_depths.get(p)
+            if d is not None:
+                m = self._mid(d)
+                if m is not None:
+                    cluster_mids.append(m)
+
+        if len(cluster_mids) < 2:
+            return self._simple_mm(prod, depth, pos)
+
+        sorted_m = sorted(cluster_mids)
+        n = len(sorted_m)
+        median = sorted_m[n // 2] if n % 2 == 1 else (sorted_m[n // 2 - 1] + sorted_m[n // 2]) / 2.0
+        mad = sum(abs(m - median) for m in cluster_mids) / len(cluster_mids)
+
+        if mad < 5.0:
+            return self._simple_mm(prod, depth, pos)
+
+        z = (mid - median) / max(1.0, mad)
+
+        if abs(z) >= 1.25:
+            target = -self.LIMIT if z > 0 else self.LIMIT
+        elif abs(z) >= 0.45:
+            target = -5 if z > 0 else 5
+        else:
+            target = 0
+
+        orders: List[Order] = []
+        delta = target - pos
+        best_bid, best_ask, _, _ = self._best(depth)
+        if delta > 0 and best_ask is not None:
+            qty = min(delta, self.LIMIT - pos)
+            if qty > 0:
+                orders.append(Order(prod, best_ask, qty))
+        elif delta < 0 and best_bid is not None:
+            qty = min(-delta, self.LIMIT + pos)
+            if qty > 0:
+                orders.append(Order(prod, best_bid, -qty))
+
+        if abs(z) < 1.25:
+            sim_pos = pos + sum(o.quantity for o in orders)
+            orders.extend(self._simple_mm(prod, depth, sim_pos))
+
+        return orders
+
     def run(self, state: TradingState):
         data = self._load(state.traderData)
         if int(data.get("last_timestamp", -1)) >= 0 and state.timestamp < int(data.get("last_timestamp", -1)):
@@ -995,7 +1066,6 @@ class Trader:
 
             krec = data.get("kalman", {}).get(product)
             kalman_x = float(krec[0]) if isinstance(krec, list) and len(krec) == 2 else float(mid)
-
             if product == "ROBOT_DISHES":
                 od, new_hist = self._trade_dishes_risk_managed(
                     depth,
