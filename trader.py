@@ -227,7 +227,6 @@ class Trader:
     BLOCKED_PRODUCTS = {
         "PANEL_4X4",
         "PANEL_1X2",
-        "SLEEP_POD_LAMB_WOOL",
     }
 
     TREND_OVERLAY = {
@@ -294,6 +293,57 @@ class Trader:
 
     _ALPHA_TREND_LONG = frozenset({"ROBOT_MOPPING", "SLEEP_POD_SUEDE", "SLEEP_POD_POLYESTER"})
     _SIMPLE_MM_PRODUCTS = frozenset({"SLEEP_POD_LAMB_WOOL", "SLEEP_POD_NYLON", "ROBOT_VACUUMING", "ROBOT_LAUNDRY"})
+
+    SLEEP_SPECIALIST_PRODUCTS = frozenset({
+        "SLEEP_POD_POLYESTER",
+        "SLEEP_POD_SUEDE",
+        "SLEEP_POD_LAMB_WOOL",
+    })
+    SLEEP_L3_FADE_SCALE = {
+        "SLEEP_POD_POLYESTER": 4.0,
+        "SLEEP_POD_SUEDE": 4.0,
+        "SLEEP_POD_LAMB_WOOL": 4.0,
+    }
+    SLEEP_BASKET_GATE_Z = 0.5
+    SLEEP_PODS_FOR_BASKET = frozenset({
+        "SLEEP_POD_SUEDE",
+        "SLEEP_POD_LAMB_WOOL",
+        "SLEEP_POD_POLYESTER",
+        "SLEEP_POD_NYLON",
+        "SLEEP_POD_COTTON",
+    })
+    SLEEP_BASKET_CONFIG = {
+        "SLEEP_POD_POLYESTER": {
+            "std": 329.8745674945989,
+            "intercept": 4433.980734590974,
+            "beta": {
+                "SLEEP_POD_SUEDE": 0.4676562476412694,
+                "SLEEP_POD_LAMB_WOOL": -0.09048537017181184,
+                "SLEEP_POD_NYLON": -0.39227441564386065,
+                "SLEEP_POD_COTTON": 0.5775617354490784,
+            },
+        },
+        "SLEEP_POD_SUEDE": {
+            "std": 478.4540086147667,
+            "intercept": -2067.3376032330703,
+            "beta": {
+                "SLEEP_POD_LAMB_WOOL": -0.010117822402983095,
+                "SLEEP_POD_POLYESTER": 0.9838060062385531,
+                "SLEEP_POD_NYLON": 0.18421799452223742,
+                "SLEEP_POD_COTTON": 0.03205572092133939,
+            },
+        },
+        "SLEEP_POD_LAMB_WOOL": {
+            "std": 376.49259435468553,
+            "intercept": 6849.969856804664,
+            "beta": {
+                "SLEEP_POD_SUEDE": -0.006264977740961783,
+                "SLEEP_POD_POLYESTER": -0.11786736513885243,
+                "SLEEP_POD_NYLON": 0.4794981278277742,
+                "SLEEP_POD_COTTON": 0.06236700073516688,
+            },
+        },
+    }
 
     TRANSLATOR_PRODUCTS = frozenset({
         "TRANSLATOR_ASTRO_BLACK",
@@ -1311,6 +1361,88 @@ class Trader:
 
         return self._robot_snippet_mm_orders(product, depth, fair, pos, bid_off, ask_off)
 
+    @staticmethod
+    def _sleep_l3_imbalance(depth: OrderDepth) -> float:
+        bid_levels = sorted(depth.buy_orders.items(), key=lambda item: -item[0])
+        ask_levels = sorted(depth.sell_orders.items(), key=lambda item: item[0])
+        bid_qty = max(0, int(bid_levels[2][1])) if len(bid_levels) >= 3 else 0
+        ask_qty = max(0, -int(ask_levels[2][1])) if len(ask_levels) >= 3 else 0
+        denom = bid_qty + ask_qty
+        return (bid_qty - ask_qty) / float(denom) if denom > 0 else 0.0
+
+    def _sleep_pod_mids(self, state: TradingState) -> Dict[str, float]:
+        mids: Dict[str, float] = {}
+        for product in self.SLEEP_PODS_FOR_BASKET:
+            depth = state.order_depths.get(product)
+            if depth is None:
+                continue
+            mid = self._mid(depth)
+            if mid is not None:
+                mids[product] = float(mid)
+        return mids
+
+    def _sleep_basket_disagrees(self, product: str, alpha: float, pod_mids: Dict[str, float]) -> bool:
+        if alpha == 0.0:
+            return False
+        cfg = self.SLEEP_BASKET_CONFIG.get(product)
+        if cfg is None or product not in pod_mids:
+            return False
+        beta = cfg["beta"]
+        if any(other not in pod_mids for other in beta):
+            return False
+
+        predicted = float(cfg["intercept"])
+        for other, weight in beta.items():
+            predicted += float(weight) * float(pod_mids[other])
+        residual = float(pod_mids[product]) - predicted
+        z = abs(residual) / max(1e-9, float(cfg["std"]))
+        if z < float(self.SLEEP_BASKET_GATE_Z):
+            return False
+
+        slow_alpha = -residual
+        return float(alpha) * float(slow_alpha) < 0.0
+
+    def _trade_sleep_specialist(
+        self,
+        product: str,
+        depth: OrderDepth,
+        pos: int,
+        pod_mids: Dict[str, float],
+    ) -> List[Order]:
+        best_bid, best_ask, _, _ = self._best(depth)
+        if best_bid is None or best_ask is None:
+            return []
+
+        mid = 0.5 * (best_bid + best_ask)
+        l3_imb = self._sleep_l3_imbalance(depth)
+        if l3_imb == 0.0:
+            return []
+
+        base_fair = mid - float(self.SLEEP_L3_FADE_SCALE[product]) * l3_imb
+        take_fair = mid if self._sleep_basket_disagrees(product, base_fair - mid, pod_mids) else base_fair
+
+        buy_cap = int(self.LIMIT - pos)
+        sell_cap = int(self.LIMIT + pos)
+        orders: List[Order] = []
+
+        for price in sorted(depth.sell_orders):
+            if price > take_fair or buy_cap <= 0:
+                break
+            qty = min(buy_cap, -int(depth.sell_orders[price]))
+            if qty > 0:
+                orders.append(Order(product, int(price), int(qty)))
+                buy_cap -= qty
+
+        for price in sorted(depth.buy_orders, reverse=True):
+            if price < take_fair or sell_cap <= 0:
+                break
+            qty = min(sell_cap, int(depth.buy_orders[price]))
+            if qty > 0:
+                orders.append(Order(product, int(price), -int(qty)))
+                sell_cap -= qty
+
+        return orders
+
     def _trade_cotton_reversion(self, state: TradingState, pos: int) -> List[Order]:
         prod = "SLEEP_POD_COTTON"
         depth = state.order_depths.get(prod)
@@ -1397,6 +1529,7 @@ class Trader:
         result.update(galaxy_orders)
 
         dishes_hist_in = list(data.get("dishes_mid_hist") or []) if isinstance(data.get("dishes_mid_hist"), list) else []
+        sleep_pod_mids = self._sleep_pod_mids(state)
 
         for product in self.PRODUCTS:
             if product in self.BLOCKED_PRODUCTS:
@@ -1418,6 +1551,8 @@ class Trader:
             kalman_x = float(krec[0]) if isinstance(krec, list) and len(krec) == 2 else float(mid)
             if product in self.ROBOT_SNIPPET_PRODUCTS:
                 orders = self._trade_robot_snippet(product, depth, pos, data)
+            elif product in self.SLEEP_SPECIALIST_PRODUCTS:
+                orders = self._trade_sleep_specialist(product, depth, pos, sleep_pod_mids)
             elif product == "ROBOT_DISHES":
                 od, new_hist = self._trade_dishes_risk_managed(
                     depth,
