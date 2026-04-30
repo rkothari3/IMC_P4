@@ -225,8 +225,6 @@ class Trader:
     )
 
     BLOCKED_PRODUCTS = {
-        "PANEL_4X4",
-        "PANEL_1X2",
     }
 
     TREND_OVERLAY = {
@@ -324,6 +322,30 @@ class Trader:
         "PEBBLES_M": 0.5,
         "PEBBLES_L": 0.5,
     }
+
+    PANEL_SPECIALIST_PRODUCTS = frozenset({
+        "PANEL_1X2",
+        "PANEL_2X2",
+        "PANEL_1X4",
+        "PANEL_2X4",
+        "PANEL_4X4",
+    })
+    PANEL_PAIRS = (
+        ("PANEL_2X2", "PANEL_2X4", 1000, 3.0, 0.45, 10),
+        ("PANEL_1X2", "PANEL_4X4", 2000, 2.5, 0.40, 10),
+    )
+    PANEL_MOMENTUM = {
+        "PANEL_1X4": (500, 0.5, 10),
+    }
+    PANEL_DIRECTIONAL_TARGETS = {
+        "PANEL_2X4": 10,
+        "PANEL_4X4": -10,
+    }
+    PANEL_LEAD_LAG = (
+        ("PANEL_2X2", "PANEL_1X2", 1000, 1.5, -1, 500),
+    )
+    PANEL_MIN_STD = 8.0
+    PANEL_MAX_HISTORY = 2200
 
     SLEEP_SPECIALIST_PRODUCTS = frozenset({
         "SLEEP_POD_POLYESTER",
@@ -449,6 +471,7 @@ class Trader:
             "robot_prev_mid": {},
             "robot_zero_buf": {},
             "pebbles": {},
+            "panels": {},
         }
         if not trader_data:
             return base
@@ -485,6 +508,7 @@ class Trader:
             "robot_prev_mid": {},
             "robot_zero_buf": {},
             "pebbles": {},
+            "panels": {},
         }
 
     def _open_mom_target(self, product: str, data: dict, mid: float) -> Optional[int]:
@@ -1683,6 +1707,174 @@ class Trader:
 
         return orders
 
+    def _panel_store(self, data: dict) -> dict:
+        store = data.setdefault("panels", {})
+        if not isinstance(store, dict):
+            store = {}
+            data["panels"] = store
+        for key in ("spread_history", "mid_history", "pair_targets", "momentum_targets", "lead_lag_targets", "lead_lag_entry_ts"):
+            if not isinstance(store.get(key), dict):
+                store[key] = {}
+        return store
+
+    def _panel_push(self, store: dict, bucket: str, key: str, value: float) -> list:
+        series = store[bucket].get(key, [])
+        if not isinstance(series, list):
+            series = []
+        series.append(float(value))
+        if len(series) > int(self.PANEL_MAX_HISTORY):
+            del series[: len(series) - int(self.PANEL_MAX_HISTORY)]
+        store[bucket][key] = series
+        return series
+
+    def _panel_mean_std(self, values: List[float], window: int):
+        sample = values[-int(window):]
+        if len(sample) < max(30, int(window) // 4):
+            return None
+        mu = sum(float(x) for x in sample) / float(len(sample))
+        var = sum((float(x) - mu) ** 2 for x in sample) / float(len(sample))
+        return mu, max(math.sqrt(max(0.0, var)), float(self.PANEL_MIN_STD))
+
+    def _panel_pair_target(self, store: dict, key: str, spread: float, window: int, entry_z: float, exit_z: float, size: int) -> int:
+        series = self._panel_push(store, "spread_history", key, spread)
+        stats = self._panel_mean_std(series[:-1], int(window))
+        previous = int(store["pair_targets"].get(key, 0))
+        if stats is None:
+            return previous
+        mu, sd = stats
+        z = (float(spread) - mu) / sd
+        if z > float(entry_z):
+            target = -int(size)
+        elif z < -float(entry_z):
+            target = int(size)
+        elif abs(z) < float(exit_z):
+            target = 0
+        else:
+            target = previous
+        store["pair_targets"][key] = int(target)
+        return int(target)
+
+    def _panel_momentum_target(self, store: dict, product: str, mid: float, lookback: int, z_mult: float, size: int) -> int:
+        series = self._panel_push(store, "mid_history", product, mid)
+        previous = int(store["momentum_targets"].get(product, 0))
+        lookback = int(lookback)
+        if len(series) < lookback + 30:
+            return previous
+        sample = series[-lookback - 1:]
+        returns = [float(sample[i]) - float(sample[i - 1]) for i in range(1, len(sample))]
+        ret_std = max(math.sqrt(sum(r * r for r in returns) / float(max(1, len(returns)))), float(self.PANEL_MIN_STD))
+        move = float(series[-1]) - float(series[-lookback])
+        threshold = float(z_mult) * ret_std * math.sqrt(float(lookback))
+        if move > threshold:
+            target = int(size)
+        elif move < -threshold:
+            target = -int(size)
+        elif abs(move) < 0.35 * threshold:
+            target = 0
+        else:
+            target = previous
+        store["momentum_targets"][product] = int(target)
+        return int(target)
+
+    def _panel_move_std(self, values: list, lookback: int):
+        lookback = int(lookback)
+        if len(values) < lookback + 30:
+            return None
+        moves = [float(values[i]) - float(values[i - lookback]) for i in range(lookback, len(values))]
+        mu = sum(moves) / float(max(1, len(moves)))
+        var = sum((x - mu) ** 2 for x in moves) / float(max(1, len(moves)))
+        return max(math.sqrt(max(0.0, var)), float(self.PANEL_MIN_STD))
+
+    def _panel_lead_lag_target(
+        self,
+        store: dict,
+        leader: str,
+        follower: str,
+        leader_mid: float,
+        lookback: int,
+        entry_z: float,
+        direction: int,
+        max_hold: int,
+        timestamp: int,
+    ) -> int:
+        series = store["mid_history"].get(leader, [])
+        if not isinstance(series, list):
+            series = []
+        key = f"{leader}|{follower}"
+        previous = int(store["lead_lag_targets"].get(key, 0))
+        target = previous
+        lookback = int(lookback)
+        if len(series) >= lookback + 30:
+            sd = self._panel_move_std(series, lookback)
+            if sd is not None:
+                move = float(leader_mid) - float(series[-lookback])
+                if previous == 0:
+                    if move > float(entry_z) * sd:
+                        target = int(direction) * self.LIMIT
+                        store["lead_lag_entry_ts"][key] = int(timestamp)
+                    elif move < -float(entry_z) * sd:
+                        target = -int(direction) * self.LIMIT
+                        store["lead_lag_entry_ts"][key] = int(timestamp)
+                else:
+                    age = int(timestamp) - int(store["lead_lag_entry_ts"].get(key, timestamp))
+                    if age >= int(max_hold) * 100:
+                        target = 0
+                        store["lead_lag_entry_ts"].pop(key, None)
+        store["lead_lag_targets"][key] = int(target)
+        return int(target)
+
+    def _panel_specialist_targets(self, state: TradingState, data: dict) -> Dict[str, int]:
+        store = self._panel_store(data)
+        raw_targets: Dict[str, int] = {}
+
+        for a, b, window, entry_z, exit_z, size in self.PANEL_PAIRS:
+            mid_a = self._mid(state.order_depths.get(a))
+            mid_b = self._mid(state.order_depths.get(b))
+            if mid_a is None or mid_b is None:
+                continue
+            target = self._panel_pair_target(store, f"{a}|{b}", float(mid_a) - float(mid_b), int(window), float(entry_z), float(exit_z), int(size))
+            raw_targets[a] = raw_targets.get(a, 0) + target
+            raw_targets[b] = raw_targets.get(b, 0) - target
+
+        for product, (lookback, z_mult, size) in self.PANEL_MOMENTUM.items():
+            mid = self._mid(state.order_depths.get(product))
+            if mid is None:
+                continue
+            target = self._panel_momentum_target(store, product, float(mid), int(lookback), float(z_mult), int(size))
+            raw_targets[product] = raw_targets.get(product, 0) + target
+
+        lead_lag_leaders = {leader for leader, *_ in self.PANEL_LEAD_LAG if leader not in self.PANEL_MOMENTUM}
+        for product in lead_lag_leaders:
+            mid = self._mid(state.order_depths.get(product))
+            if mid is not None:
+                self._panel_push(store, "mid_history", product, float(mid))
+
+        for leader, follower, lookback, entry_z, direction, max_hold in self.PANEL_LEAD_LAG:
+            leader_mid = self._mid(state.order_depths.get(leader))
+            follower_mid = self._mid(state.order_depths.get(follower))
+            if leader_mid is None or follower_mid is None:
+                continue
+            target = self._panel_lead_lag_target(
+                store,
+                leader,
+                follower,
+                float(leader_mid),
+                int(lookback),
+                float(entry_z),
+                int(direction),
+                int(max_hold),
+                int(state.timestamp),
+            )
+            raw_targets[follower] = raw_targets.get(follower, 0) + target
+
+        for product, target in self.PANEL_DIRECTIONAL_TARGETS.items():
+            raw_targets[product] = raw_targets.get(product, 0) + int(target)
+
+        return {product: max(-self.LIMIT, min(self.LIMIT, int(target))) for product, target in raw_targets.items()}
+
+    def _trade_panel_specialist(self, product: str, depth: OrderDepth, pos: int, target: int) -> List[Order]:
+        return self._trade_pebble_specialist(product, depth, pos, target)
+
     def _trade_cotton_reversion(self, state: TradingState, pos: int) -> List[Order]:
         prod = "SLEEP_POD_COTTON"
         depth = state.order_depths.get(prod)
@@ -1776,6 +1968,7 @@ class Trader:
         dishes_hist_in = list(data.get("dishes_mid_hist") or []) if isinstance(data.get("dishes_mid_hist"), list) else []
         sleep_pod_mids = self._sleep_pod_mids(state)
         pebble_targets = self._pebble_specialist_targets(state, data)
+        panel_targets = self._panel_specialist_targets(state, data)
 
         for product in self.PRODUCTS:
             if product in self.BLOCKED_PRODUCTS:
@@ -1798,6 +1991,11 @@ class Trader:
             if product in self.PEBBLE_SPECIALIST_PRODUCTS:
                 if product in pebble_targets:
                     orders = self._trade_pebble_specialist(product, depth, pos, int(pebble_targets[product]))
+                else:
+                    orders = []
+            elif product in self.PANEL_SPECIALIST_PRODUCTS:
+                if product in panel_targets:
+                    orders = self._trade_panel_specialist(product, depth, pos, int(panel_targets[product]))
                 else:
                     orders = []
             elif product in self.ROBOT_SNIPPET_PRODUCTS:
