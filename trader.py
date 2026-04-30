@@ -314,6 +314,22 @@ class Trader:
 
     _GALAXY = GalaxyPairsModule()
 
+    ROBOT_SNIPPET_PRODUCTS = frozenset({
+        "ROBOT_VACUUMING",
+        "ROBOT_DISHES",
+        "ROBOT_LAUNDRY",
+        "ROBOT_IRONING",
+    })
+    ROBOT_SNIPPET_USE_LADDER = frozenset({"ROBOT_MOPPING", "ROBOT_VACUUMING"})
+    ROBOT_SNIPPET_SKIP = frozenset({"ROBOT_MOPPING"})
+    ROBOT_SNIPPET_LOTS = (2, 3, 2)
+    ROBOT_SNIPPET_OFFSETS = (-1, 0, 1)
+    ROBOT_EMA_ALPHA = 0.05
+    ROBOT_ZERO_WIN = 200
+    ROBOT_ZERO_THRESH_FADE = 0.25
+    ROBOT_ZERO_THRESH_OU = 0.70
+    ROBOT_FADE_THRESH = 3
+
     # Notebook-inspired snackpack signal (submission-safe):
     # Use the strongest relative-value pair found in our offline scan:
     # d(t) = sqrt(mid_chocolate / mid_vanilla), smooth with EWMA, then lean fair values when z is extreme.
@@ -323,6 +339,10 @@ class Trader:
     _SNACK_Z_WINDOW = 500
     _SNACK_ENTRY_Z = 2.0
     _SNACK_FAIR_CLIP = 6.0
+    _SNACK_EXTRA_PAIR_A = "SNACKPACK_STRAWBERRY"
+    _SNACK_EXTRA_PAIR_B = "SNACKPACK_PISTACHIO"
+    _SNACK_EXTRA_ENTRY_Z = 2.25
+    _SNACK_EXTRA_FAIR_CLIP = 4.0
 
     def _trend_inventory_cap(self) -> int:
         """Max abs position for capped robots (mopping / ironing)."""
@@ -343,6 +363,10 @@ class Trader:
             "translator_slow": {},
             "galaxy": {},
             "snackpair": {},
+            "snackpair_extra": {},
+            "robot_ema": {},
+            "robot_prev_mid": {},
+            "robot_zero_buf": {},
         }
         if not trader_data:
             return base
@@ -374,6 +398,10 @@ class Trader:
             "translator_slow": {},
             "galaxy": {},
             "snackpair": {},
+            "snackpair_extra": {},
+            "robot_ema": {},
+            "robot_prev_mid": {},
+            "robot_zero_buf": {},
         }
 
     def _open_mom_target(self, product: str, data: dict, mid: float) -> Optional[int]:
@@ -964,6 +992,51 @@ class Trader:
 
             data["snackpair"] = sp
 
+        # Secondary snackpack pair nudge from the component-style pair universe.
+        # Kept weaker than the chocolate/vanilla signal because earlier broad Snackpack aggression was fragile.
+        if self._SNACK_EXTRA_PAIR_A in mids and self._SNACK_EXTRA_PAIR_B in mids and float(mids[self._SNACK_EXTRA_PAIR_B]) > 0:
+            sp = data.get("snackpair_extra", {})
+            if not isinstance(sp, dict):
+                sp = {}
+            d = math.sqrt(float(mids[self._SNACK_EXTRA_PAIR_A]) / float(mids[self._SNACK_EXTRA_PAIR_B]))
+            prev = sp.get("d_ewma", None)
+            if prev is None:
+                d_ewma = float(d)
+            else:
+                a = float(self._SNACK_D_EWMA_ALPHA)
+                try:
+                    d_ewma = a * float(d) + (1.0 - a) * float(prev)
+                except (TypeError, ValueError):
+                    d_ewma = float(d)
+            sp["d_ewma"] = float(d_ewma)
+
+            res = float(d) - float(d_ewma)
+            hist = sp.get("res", [])
+            if not isinstance(hist, list):
+                hist = []
+            hist.append(float(res))
+            if len(hist) > int(self._SNACK_Z_WINDOW) + 50:
+                del hist[: len(hist) - (int(self._SNACK_Z_WINDOW) + 50)]
+            sp["res"] = hist
+
+            if len(hist) >= int(self._SNACK_Z_WINDOW):
+                window = hist[-int(self._SNACK_Z_WINDOW) :]
+                mu = sum(window) / float(len(window))
+                var = sum((x - mu) ** 2 for x in window) / float(max(1, len(window) - 1))
+                sd = math.sqrt(max(1e-9, var))
+                z = (res - mu) / sd
+
+                if abs(z) >= float(self._SNACK_EXTRA_ENTRY_Z):
+                    k = min(float(self._SNACK_EXTRA_FAIR_CLIP), max(0.0, 1.25 * abs(z)))
+                    if z > 0:
+                        adjs[self._SNACK_EXTRA_PAIR_A] = adjs.get(self._SNACK_EXTRA_PAIR_A, 0.0) - k
+                        adjs[self._SNACK_EXTRA_PAIR_B] = adjs.get(self._SNACK_EXTRA_PAIR_B, 0.0) + k
+                    else:
+                        adjs[self._SNACK_EXTRA_PAIR_A] = adjs.get(self._SNACK_EXTRA_PAIR_A, 0.0) + k
+                        adjs[self._SNACK_EXTRA_PAIR_B] = adjs.get(self._SNACK_EXTRA_PAIR_B, 0.0) - k
+
+            data["snackpair_extra"] = sp
+
         return adjs
 
     def _translator_config(self, product: str, start_mid: float) -> dict:
@@ -1089,6 +1162,155 @@ class Trader:
             orders.append(Order(product, ask_price, -min(sell_room, 10)))
         return orders
 
+    def _robot_snippet_mm_orders(
+        self,
+        product: str,
+        depth: OrderDepth,
+        fair: float,
+        pos: int,
+        bid_off: int,
+        ask_off: int,
+    ) -> List[Order]:
+        best_bid, best_ask, _, _ = self._best(depth)
+        if best_bid is None or best_ask is None or best_bid >= best_ask:
+            return []
+
+        orders: List[Order] = []
+        buy_room = max(0, self.LIMIT - pos)
+        sell_room = max(0, self.LIMIT + pos)
+
+        taken_buy = 0
+        for price in sorted(depth.sell_orders.keys()):
+            if price >= fair:
+                break
+            room = buy_room - taken_buy
+            if room <= 0:
+                break
+            take = min(room, -int(depth.sell_orders[price]))
+            if take > 0:
+                orders.append(Order(product, int(price), int(take)))
+                taken_buy += take
+
+        taken_sell = 0
+        for price in sorted(depth.buy_orders.keys(), reverse=True):
+            if price <= fair:
+                break
+            room = sell_room - taken_sell
+            if room <= 0:
+                break
+            take = min(room, int(depth.buy_orders[price]))
+            if take > 0:
+                orders.append(Order(product, int(price), -int(take)))
+                taken_sell += take
+
+        eff_pos = pos + taken_buy - taken_sell
+        if eff_pos > 0:
+            for price in depth.buy_orders.keys():
+                if price == fair:
+                    room = sell_room - taken_sell
+                    take = min(eff_pos, int(depth.buy_orders[price]), room)
+                    if take > 0:
+                        orders.append(Order(product, int(price), -int(take)))
+                        taken_sell += take
+                    break
+        elif eff_pos < 0:
+            for price in depth.sell_orders.keys():
+                if price == fair:
+                    room = buy_room - taken_buy
+                    take = min(-eff_pos, -int(depth.sell_orders[price]), room)
+                    if take > 0:
+                        orders.append(Order(product, int(price), int(take)))
+                        taken_buy += take
+                    break
+
+        rem_buy = buy_room - taken_buy
+        rem_sell = sell_room - taken_sell
+        bid_price = int(best_bid) + int(bid_off)
+        ask_price = int(best_ask) - int(ask_off)
+        if bid_price < ask_price and rem_buy > 0:
+            orders.append(Order(product, bid_price, int(rem_buy)))
+        if ask_price > bid_price and rem_sell > 0:
+            orders.append(Order(product, ask_price, -int(rem_sell)))
+        return orders
+
+    def _trade_robot_snippet(self, product: str, depth: OrderDepth, pos: int, data: dict) -> List[Order]:
+        best_bid, best_ask, _, _ = self._best(depth)
+        if best_bid is None or best_ask is None:
+            return []
+
+        mid = 0.5 * (best_bid + best_ask)
+
+        if product in self.ROBOT_SNIPPET_USE_LADDER:
+            if product in self.ROBOT_SNIPPET_SKIP:
+                return []
+
+            half_sp = max(1, int((best_ask - best_bid) // 2))
+            buy_room = int(self.LIMIT - pos)
+            sell_room = int(self.LIMIT + pos)
+            orders: List[Order] = []
+
+            for off, lot in zip(self.ROBOT_SNIPPET_OFFSETS, self.ROBOT_SNIPPET_LOTS):
+                k = max(1, half_sp + int(off))
+                bid_price = min(int(mid) - k, int(best_ask) - 1)
+                ask_price = max(int(mid) + k + 1, int(best_bid) + 1)
+                if bid_price >= ask_price:
+                    continue
+                if buy_room > 0:
+                    qty = min(int(lot), buy_room)
+                    orders.append(Order(product, bid_price, qty))
+                    buy_room -= qty
+                if sell_room > 0:
+                    qty = min(int(lot), sell_room)
+                    orders.append(Order(product, ask_price, -qty))
+                    sell_room -= qty
+            return orders
+
+        ema = data.setdefault("robot_ema", {})
+        if not isinstance(ema, dict):
+            ema = {}
+            data["robot_ema"] = ema
+        prev_mid = data.setdefault("robot_prev_mid", {})
+        if not isinstance(prev_mid, dict):
+            prev_mid = {}
+            data["robot_prev_mid"] = prev_mid
+        zero_buf = data.setdefault("robot_zero_buf", {})
+        if not isinstance(zero_buf, dict):
+            zero_buf = {}
+            data["robot_zero_buf"] = zero_buf
+
+        ema[product] = (1.0 - self.ROBOT_EMA_ALPHA) * float(ema.get(product, mid)) + self.ROBOT_EMA_ALPHA * mid
+        previous_mid = prev_mid.get(product)
+        last_ret = 0.0
+        if previous_mid is not None:
+            last_ret = mid - float(previous_mid)
+            buf = zero_buf.get(product, [])
+            if not isinstance(buf, list):
+                buf = []
+            buf.append(1 if mid == float(previous_mid) else 0)
+            if len(buf) > self.ROBOT_ZERO_WIN:
+                del buf[: len(buf) - self.ROBOT_ZERO_WIN]
+            zero_buf[product] = buf
+        prev_mid[product] = mid
+
+        buf = zero_buf.get(product, [])
+        pct_zero = (sum(buf) / len(buf)) if isinstance(buf, list) and len(buf) >= 50 else 0.0
+        if pct_zero > self.ROBOT_ZERO_THRESH_OU:
+            fair = float(ema[product])
+            bid_off, ask_off = 1, 1
+        elif pct_zero > self.ROBOT_ZERO_THRESH_FADE:
+            fair = mid
+            if last_ret >= self.ROBOT_FADE_THRESH:
+                bid_off, ask_off = 0, 2
+            elif last_ret <= -self.ROBOT_FADE_THRESH:
+                bid_off, ask_off = 2, 0
+            else:
+                bid_off, ask_off = 1, 1
+        else:
+            fair = mid
+            bid_off, ask_off = 1, 1
+
+        return self._robot_snippet_mm_orders(product, depth, fair, pos, bid_off, ask_off)
+
     def _trade_cotton_reversion(self, state: TradingState, pos: int) -> List[Order]:
         prod = "SLEEP_POD_COTTON"
         depth = state.order_depths.get(prod)
@@ -1194,7 +1416,9 @@ class Trader:
 
             krec = data.get("kalman", {}).get(product)
             kalman_x = float(krec[0]) if isinstance(krec, list) and len(krec) == 2 else float(mid)
-            if product == "ROBOT_DISHES":
+            if product in self.ROBOT_SNIPPET_PRODUCTS:
+                orders = self._trade_robot_snippet(product, depth, pos, data)
+            elif product == "ROBOT_DISHES":
                 od, new_hist = self._trade_dishes_risk_managed(
                     depth,
                     float(mid),
