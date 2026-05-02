@@ -225,6 +225,8 @@ class Trader:
     )
 
     BLOCKED_PRODUCTS = {
+        "PANEL_4X4",
+        "PANEL_1X2",
     }
 
     TREND_OVERLAY = {
@@ -269,17 +271,6 @@ class Trader:
     }
     SNACK_PRODUCTS = ("SNACKPACK_CHOCOLATE", "SNACKPACK_VANILLA", "SNACKPACK_PISTACHIO", "SNACKPACK_STRAWBERRY", "SNACKPACK_RASPBERRY")
 
-    # Snackpack basket component (inspired by provided snippet; lightweight version).
-    # Goal: compute a basket-relative residual z-score per snack product and use it to:
-    # - skew fair value (maker bias)
-    # - pull inventory toward a target position (reservation price shift)
-    SNACK_BASKET_WINDOW = 500
-    SNACK_SIGNAL_THRESHOLD = 2.0
-    SNACK_FAIR_ADJ_SCALE = 1.25
-    SNACK_FAIR_ADJ_CLIP = 4.0
-    SNACK_TARGET_SCALE = 0.65
-    SNACK_INV_LAMBDA = 0.65
-
     ROBOT_MR_DISH_WINDOW = 100
     ROBOT_MR_DISH_CAP = 1000
     DISH_MR_TRADE = 4
@@ -291,112 +282,6 @@ class Trader:
 
     _ALPHA_TREND_LONG = frozenset({"ROBOT_MOPPING", "SLEEP_POD_SUEDE", "SLEEP_POD_POLYESTER"})
     _SIMPLE_MM_PRODUCTS = frozenset({"SLEEP_POD_LAMB_WOOL", "SLEEP_POD_NYLON", "ROBOT_VACUUMING", "ROBOT_LAUNDRY"})
-
-    PEBBLE_SPECIALIST_PRODUCTS = frozenset({
-        "PEBBLES_XS",
-        "PEBBLES_S",
-        "PEBBLES_M",
-        "PEBBLES_L",
-        "PEBBLES_XL",
-    })
-    PEBBLE_XS_M = -0.1588
-    PEBBLE_XS_EXIT_THRESHOLD = -400.0
-    PEBBLE_XS_LONG_THRESHOLD = -750.0
-    PEBBLE_XS_SHORT_RE_ENTRY_THRESHOLD = -200.0
-    PEBBLE_S_M = -0.0860
-    PEBBLE_S_NEUTRAL_BAND = 100.0
-    PEBBLE_S_DEAD_ZONE = 200.0
-    PEBBLE_S_SCALE = 500.0
-    PEBBLE_S_POSITION_OFFSET = -3
-    PEBBLE_M_ANCHOR = 10000.0
-    PEBBLE_M_NEUTRAL_BAND = 100.0
-    PEBBLE_M_DEAD_ZONE = 300.0
-    PEBBLE_M_SCALE = 1250.0
-    PEBBLE_L_ANCHOR = 10000.0
-    PEBBLE_L_NEUTRAL_BAND = 100.0
-    PEBBLE_L_DEAD_ZONE = 300.0
-    PEBBLE_L_SCALE = 1250.0
-    PEBBLE_XL_WEIGHTS = {
-        "PEBBLES_XS": 1.0,
-        "PEBBLES_S": 1.0,
-        "PEBBLES_M": 0.5,
-        "PEBBLES_L": 0.5,
-    }
-
-    PANEL_SPECIALIST_PRODUCTS = frozenset({
-        "PANEL_1X2",
-        "PANEL_2X2",
-        "PANEL_1X4",
-        "PANEL_2X4",
-        "PANEL_4X4",
-    })
-    PANEL_PAIRS = (
-        ("PANEL_2X2", "PANEL_2X4", 1000, 3.0, 0.45, 10),
-        ("PANEL_1X2", "PANEL_4X4", 2000, 2.5, 0.40, 10),
-    )
-    PANEL_MOMENTUM = {
-        "PANEL_1X4": (500, 0.5, 10),
-    }
-    PANEL_DIRECTIONAL_TARGETS = {
-        "PANEL_2X4": 10,
-        "PANEL_4X4": -10,
-    }
-    PANEL_LEAD_LAG = (
-        ("PANEL_2X2", "PANEL_1X2", 1000, 1.5, -1, 500),
-    )
-    PANEL_MIN_STD = 8.0
-    PANEL_MAX_HISTORY = 2200
-
-    SLEEP_SPECIALIST_PRODUCTS = frozenset({
-        "SLEEP_POD_POLYESTER",
-        "SLEEP_POD_SUEDE",
-        "SLEEP_POD_LAMB_WOOL",
-    })
-    SLEEP_L3_FADE_SCALE = {
-        "SLEEP_POD_POLYESTER": 4.0,
-        "SLEEP_POD_SUEDE": 4.0,
-        "SLEEP_POD_LAMB_WOOL": 4.0,
-    }
-    SLEEP_BASKET_GATE_Z = 0.5
-    SLEEP_PODS_FOR_BASKET = frozenset({
-        "SLEEP_POD_SUEDE",
-        "SLEEP_POD_LAMB_WOOL",
-        "SLEEP_POD_POLYESTER",
-        "SLEEP_POD_NYLON",
-        "SLEEP_POD_COTTON",
-    })
-    SLEEP_BASKET_CONFIG = {
-        "SLEEP_POD_POLYESTER": {
-            "std": 329.8745674945989,
-            "intercept": 4433.980734590974,
-            "beta": {
-                "SLEEP_POD_SUEDE": 0.4676562476412694,
-                "SLEEP_POD_LAMB_WOOL": -0.09048537017181184,
-                "SLEEP_POD_NYLON": -0.39227441564386065,
-                "SLEEP_POD_COTTON": 0.5775617354490784,
-            },
-        },
-        "SLEEP_POD_SUEDE": {
-            "std": 478.4540086147667,
-            "intercept": -2067.3376032330703,
-            "beta": {
-                "SLEEP_POD_LAMB_WOOL": -0.010117822402983095,
-                "SLEEP_POD_POLYESTER": 0.9838060062385531,
-                "SLEEP_POD_NYLON": 0.18421799452223742,
-                "SLEEP_POD_COTTON": 0.03205572092133939,
-            },
-        },
-        "SLEEP_POD_LAMB_WOOL": {
-            "std": 376.49259435468553,
-            "intercept": 6849.969856804664,
-            "beta": {
-                "SLEEP_POD_SUEDE": -0.006264977740961783,
-                "SLEEP_POD_POLYESTER": -0.11786736513885243,
-                "SLEEP_POD_NYLON": 0.4794981278277742,
-                "SLEEP_POD_COTTON": 0.06236700073516688,
-            },
-        },
-    }
 
     TRANSLATOR_PRODUCTS = frozenset({
         "TRANSLATOR_ASTRO_BLACK",
@@ -417,22 +302,6 @@ class Trader:
 
     _GALAXY = GalaxyPairsModule()
 
-    ROBOT_SNIPPET_PRODUCTS = frozenset({
-        "ROBOT_VACUUMING",
-        "ROBOT_DISHES",
-        "ROBOT_LAUNDRY",
-        "ROBOT_IRONING",
-    })
-    ROBOT_SNIPPET_USE_LADDER = frozenset({"ROBOT_MOPPING", "ROBOT_VACUUMING"})
-    ROBOT_SNIPPET_SKIP = frozenset({"ROBOT_MOPPING"})
-    ROBOT_SNIPPET_LOTS = (2, 3, 2)
-    ROBOT_SNIPPET_OFFSETS = (-1, 0, 1)
-    ROBOT_EMA_ALPHA = 0.05
-    ROBOT_ZERO_WIN = 200
-    ROBOT_ZERO_THRESH_FADE = 0.25
-    ROBOT_ZERO_THRESH_OU = 0.70
-    ROBOT_FADE_THRESH = 3
-
     # Notebook-inspired snackpack signal (submission-safe):
     # Use the strongest relative-value pair found in our offline scan:
     # d(t) = sqrt(mid_chocolate / mid_vanilla), smooth with EWMA, then lean fair values when z is extreme.
@@ -442,16 +311,6 @@ class Trader:
     _SNACK_Z_WINDOW = 500
     _SNACK_ENTRY_Z = 2.0
     _SNACK_FAIR_CLIP = 6.0
-    _SNACK_EXTRA_PAIR_A = "SNACKPACK_STRAWBERRY"
-    _SNACK_EXTRA_PAIR_B = "SNACKPACK_PISTACHIO"
-    _SNACK_EXTRA_ENTRY_Z = 2.25
-    _SNACK_EXTRA_FAIR_CLIP = 4.0
-    _SNACK_RASPBERRY_PAIR_A = "SNACKPACK_STRAWBERRY"
-    _SNACK_RASPBERRY_PAIR_B = "SNACKPACK_RASPBERRY"
-    _SNACK_RASPBERRY_ALPHA = 0.0001
-    _SNACK_RASPBERRY_Z_WINDOW = 1000
-    _SNACK_RASPBERRY_ENTRY_Z = 2.0
-    _SNACK_RASPBERRY_FAIR_CLIP = 6.0
 
     def _trend_inventory_cap(self) -> int:
         """Max abs position for capped robots (mopping / ironing)."""
@@ -472,13 +331,6 @@ class Trader:
             "translator_slow": {},
             "galaxy": {},
             "snackpair": {},
-            "snackpair_extra": {},
-            "snackpair_raspberry": {},
-            "robot_ema": {},
-            "robot_prev_mid": {},
-            "robot_zero_buf": {},
-            "pebbles": {},
-            "panels": {},
         }
         if not trader_data:
             return base
@@ -510,13 +362,6 @@ class Trader:
             "translator_slow": {},
             "galaxy": {},
             "snackpair": {},
-            "snackpair_extra": {},
-            "snackpair_raspberry": {},
-            "robot_ema": {},
-            "robot_prev_mid": {},
-            "robot_zero_buf": {},
-            "pebbles": {},
-            "panels": {},
         }
 
     def _open_mom_target(self, product: str, data: dict, mid: float) -> Optional[int]:
@@ -1012,55 +857,6 @@ class Trader:
                     adjs[product] = adjs.get(product, 0.0) + max(-5.0, min(5.0, coeff * delta))
         data["snack_prev"] = {p: mids[p] for p in self.SNACK_PRODUCTS if p in mids}
 
-        # Snackpack basket-relative residual component (reservation price skew + target inventory).
-        # We treat the snack basket as equal-weight mean of mids, then track each leg's residual vs basket.
-        sb = data.get("snack_basket", {})
-        if not isinstance(sb, dict):
-            sb = {}
-        hist = sb.get("h", {})
-        if not isinstance(hist, dict):
-            hist = {}
-        targets = sb.get("tgt", {})
-        if not isinstance(targets, dict):
-            targets = {}
-
-        if snack_cur and len(snack_cur) == len([p for p in self.SNACK_PRODUCTS if p in mids]):
-            basket = sum(float(mids[p]) for p in self.SNACK_PRODUCTS if p in mids) / float(len(self.SNACK_PRODUCTS))
-            for p in self.SNACK_PRODUCTS:
-                if p not in mids:
-                    continue
-                residual = float(mids[p]) - float(basket)
-                series = hist.get(p)
-                if not isinstance(series, list):
-                    series = []
-                series.append(float(residual))
-                if len(series) > int(self.SNACK_BASKET_WINDOW) + 50:
-                    del series[: len(series) - (int(self.SNACK_BASKET_WINDOW) + 50)]
-                hist[p] = series
-
-                if len(series) >= int(self.SNACK_BASKET_WINDOW):
-                    window = series[-int(self.SNACK_BASKET_WINDOW) :]
-                    mu = sum(window) / float(len(window))
-                    var = sum((x - mu) ** 2 for x in window) / float(max(1, len(window) - 1))
-                    sd = math.sqrt(max(1e-9, var))
-                    z = (residual - mu) / sd
-
-                    if abs(z) >= float(self.SNACK_SIGNAL_THRESHOLD):
-                        # If residual is rich (z>0), we want to sell it => fair skew negative, target short.
-                        # If cheap (z<0), we want to buy it => fair skew positive, target long.
-                        k = max(-float(self.SNACK_FAIR_ADJ_CLIP), min(float(self.SNACK_FAIR_ADJ_CLIP), -float(self.SNACK_FAIR_ADJ_SCALE) * float(z)))
-                        adjs[p] = adjs.get(p, 0.0) + float(k)
-                        tgt = int(round(-float(self.SNACK_TARGET_SCALE) * float(z) * float(self.LIMIT)))
-                        targets[p] = int(max(-self.LIMIT, min(self.LIMIT, tgt)))
-                    else:
-                        targets[p] = 0
-                else:
-                    targets[p] = int(targets.get(p, 0))
-
-        sb["h"] = hist
-        sb["tgt"] = targets
-        data["snack_basket"] = sb
-
         # Snackpack pair drift-reversion (Pistachio vs Strawberry), implemented as fair nudges (not forced crossing).
         # This avoids paying the very wide snackpack spread while still biasing your maker to lean the right way.
         if self._SNACK_A in mids and self._SNACK_B in mids and float(mids[self._SNACK_B]) > 0:
@@ -1106,96 +902,6 @@ class Trader:
                         adjs[self._SNACK_B] = adjs.get(self._SNACK_B, 0.0) - k
 
             data["snackpair"] = sp
-
-        # Secondary snackpack pair nudge from the component-style pair universe.
-        # Kept weaker than the chocolate/vanilla signal because earlier broad Snackpack aggression was fragile.
-        if self._SNACK_EXTRA_PAIR_A in mids and self._SNACK_EXTRA_PAIR_B in mids and float(mids[self._SNACK_EXTRA_PAIR_B]) > 0:
-            sp = data.get("snackpair_extra", {})
-            if not isinstance(sp, dict):
-                sp = {}
-            d = math.sqrt(float(mids[self._SNACK_EXTRA_PAIR_A]) / float(mids[self._SNACK_EXTRA_PAIR_B]))
-            prev = sp.get("d_ewma", None)
-            if prev is None:
-                d_ewma = float(d)
-            else:
-                a = float(self._SNACK_D_EWMA_ALPHA)
-                try:
-                    d_ewma = a * float(d) + (1.0 - a) * float(prev)
-                except (TypeError, ValueError):
-                    d_ewma = float(d)
-            sp["d_ewma"] = float(d_ewma)
-
-            res = float(d) - float(d_ewma)
-            hist = sp.get("res", [])
-            if not isinstance(hist, list):
-                hist = []
-            hist.append(float(res))
-            if len(hist) > int(self._SNACK_Z_WINDOW) + 50:
-                del hist[: len(hist) - (int(self._SNACK_Z_WINDOW) + 50)]
-            sp["res"] = hist
-
-            if len(hist) >= int(self._SNACK_Z_WINDOW):
-                window = hist[-int(self._SNACK_Z_WINDOW) :]
-                mu = sum(window) / float(len(window))
-                var = sum((x - mu) ** 2 for x in window) / float(max(1, len(window) - 1))
-                sd = math.sqrt(max(1e-9, var))
-                z = (res - mu) / sd
-
-                if abs(z) >= float(self._SNACK_EXTRA_ENTRY_Z):
-                    k = min(float(self._SNACK_EXTRA_FAIR_CLIP), max(0.0, 1.25 * abs(z)))
-                    if z > 0:
-                        adjs[self._SNACK_EXTRA_PAIR_A] = adjs.get(self._SNACK_EXTRA_PAIR_A, 0.0) - k
-                        adjs[self._SNACK_EXTRA_PAIR_B] = adjs.get(self._SNACK_EXTRA_PAIR_B, 0.0) + k
-                    else:
-                        adjs[self._SNACK_EXTRA_PAIR_A] = adjs.get(self._SNACK_EXTRA_PAIR_A, 0.0) + k
-                        adjs[self._SNACK_EXTRA_PAIR_B] = adjs.get(self._SNACK_EXTRA_PAIR_B, 0.0) - k
-
-            data["snackpair_extra"] = sp
-
-        # Notebook scan: Raspberry/Strawberry had the strongest late-notebook residual signal.
-        # Use much slower smoothing than the existing pair overlays to approximate the Kalman trend plot.
-        if self._SNACK_RASPBERRY_PAIR_A in mids and self._SNACK_RASPBERRY_PAIR_B in mids and float(mids[self._SNACK_RASPBERRY_PAIR_B]) > 0:
-            sp = data.get("snackpair_raspberry", {})
-            if not isinstance(sp, dict):
-                sp = {}
-            d = math.sqrt(float(mids[self._SNACK_RASPBERRY_PAIR_A]) / float(mids[self._SNACK_RASPBERRY_PAIR_B]))
-            prev = sp.get("d_ewma", None)
-            if prev is None:
-                d_ewma = float(d)
-            else:
-                a = float(self._SNACK_RASPBERRY_ALPHA)
-                try:
-                    d_ewma = a * float(d) + (1.0 - a) * float(prev)
-                except (TypeError, ValueError):
-                    d_ewma = float(d)
-            sp["d_ewma"] = float(d_ewma)
-
-            res = float(d) - float(d_ewma)
-            hist = sp.get("res", [])
-            if not isinstance(hist, list):
-                hist = []
-            hist.append(float(res))
-            if len(hist) > int(self._SNACK_RASPBERRY_Z_WINDOW) + 50:
-                del hist[: len(hist) - (int(self._SNACK_RASPBERRY_Z_WINDOW) + 50)]
-            sp["res"] = hist
-
-            if len(hist) >= int(self._SNACK_RASPBERRY_Z_WINDOW):
-                window = hist[-int(self._SNACK_RASPBERRY_Z_WINDOW) :]
-                mu = sum(window) / float(len(window))
-                var = sum((x - mu) ** 2 for x in window) / float(max(1, len(window) - 1))
-                sd = math.sqrt(max(1e-9, var))
-                z = (res - mu) / sd
-
-                if abs(z) >= float(self._SNACK_RASPBERRY_ENTRY_Z):
-                    k = min(float(self._SNACK_RASPBERRY_FAIR_CLIP), max(0.0, 1.8 * abs(z)))
-                    if z > 0:
-                        adjs[self._SNACK_RASPBERRY_PAIR_A] = adjs.get(self._SNACK_RASPBERRY_PAIR_A, 0.0) - k
-                        adjs[self._SNACK_RASPBERRY_PAIR_B] = adjs.get(self._SNACK_RASPBERRY_PAIR_B, 0.0) + k
-                    else:
-                        adjs[self._SNACK_RASPBERRY_PAIR_A] = adjs.get(self._SNACK_RASPBERRY_PAIR_A, 0.0) + k
-                        adjs[self._SNACK_RASPBERRY_PAIR_B] = adjs.get(self._SNACK_RASPBERRY_PAIR_B, 0.0) - k
-
-            data["snackpair_raspberry"] = sp
 
         return adjs
 
@@ -1322,612 +1028,6 @@ class Trader:
             orders.append(Order(product, ask_price, -min(sell_room, 10)))
         return orders
 
-    def _robot_snippet_mm_orders(
-        self,
-        product: str,
-        depth: OrderDepth,
-        fair: float,
-        pos: int,
-        bid_off: int,
-        ask_off: int,
-    ) -> List[Order]:
-        best_bid, best_ask, _, _ = self._best(depth)
-        if best_bid is None or best_ask is None or best_bid >= best_ask:
-            return []
-
-        orders: List[Order] = []
-        buy_room = max(0, self.LIMIT - pos)
-        sell_room = max(0, self.LIMIT + pos)
-
-        taken_buy = 0
-        for price in sorted(depth.sell_orders.keys()):
-            if price >= fair:
-                break
-            room = buy_room - taken_buy
-            if room <= 0:
-                break
-            take = min(room, -int(depth.sell_orders[price]))
-            if take > 0:
-                orders.append(Order(product, int(price), int(take)))
-                taken_buy += take
-
-        taken_sell = 0
-        for price in sorted(depth.buy_orders.keys(), reverse=True):
-            if price <= fair:
-                break
-            room = sell_room - taken_sell
-            if room <= 0:
-                break
-            take = min(room, int(depth.buy_orders[price]))
-            if take > 0:
-                orders.append(Order(product, int(price), -int(take)))
-                taken_sell += take
-
-        eff_pos = pos + taken_buy - taken_sell
-        if eff_pos > 0:
-            for price in depth.buy_orders.keys():
-                if price == fair:
-                    room = sell_room - taken_sell
-                    take = min(eff_pos, int(depth.buy_orders[price]), room)
-                    if take > 0:
-                        orders.append(Order(product, int(price), -int(take)))
-                        taken_sell += take
-                    break
-        elif eff_pos < 0:
-            for price in depth.sell_orders.keys():
-                if price == fair:
-                    room = buy_room - taken_buy
-                    take = min(-eff_pos, -int(depth.sell_orders[price]), room)
-                    if take > 0:
-                        orders.append(Order(product, int(price), int(take)))
-                        taken_buy += take
-                    break
-
-        rem_buy = buy_room - taken_buy
-        rem_sell = sell_room - taken_sell
-        bid_price = int(best_bid) + int(bid_off)
-        ask_price = int(best_ask) - int(ask_off)
-        if bid_price < ask_price and rem_buy > 0:
-            orders.append(Order(product, bid_price, int(rem_buy)))
-        if ask_price > bid_price and rem_sell > 0:
-            orders.append(Order(product, ask_price, -int(rem_sell)))
-        return orders
-
-    def _trade_robot_snippet(self, product: str, depth: OrderDepth, pos: int, data: dict) -> List[Order]:
-        best_bid, best_ask, _, _ = self._best(depth)
-        if best_bid is None or best_ask is None:
-            return []
-
-        mid = 0.5 * (best_bid + best_ask)
-
-        if product in self.ROBOT_SNIPPET_USE_LADDER:
-            if product in self.ROBOT_SNIPPET_SKIP:
-                return []
-
-            half_sp = max(1, int((best_ask - best_bid) // 2))
-            buy_room = int(self.LIMIT - pos)
-            sell_room = int(self.LIMIT + pos)
-            orders: List[Order] = []
-
-            for off, lot in zip(self.ROBOT_SNIPPET_OFFSETS, self.ROBOT_SNIPPET_LOTS):
-                k = max(1, half_sp + int(off))
-                bid_price = min(int(mid) - k, int(best_ask) - 1)
-                ask_price = max(int(mid) + k + 1, int(best_bid) + 1)
-                if bid_price >= ask_price:
-                    continue
-                if buy_room > 0:
-                    qty = min(int(lot), buy_room)
-                    orders.append(Order(product, bid_price, qty))
-                    buy_room -= qty
-                if sell_room > 0:
-                    qty = min(int(lot), sell_room)
-                    orders.append(Order(product, ask_price, -qty))
-                    sell_room -= qty
-            return orders
-
-        ema = data.setdefault("robot_ema", {})
-        if not isinstance(ema, dict):
-            ema = {}
-            data["robot_ema"] = ema
-        prev_mid = data.setdefault("robot_prev_mid", {})
-        if not isinstance(prev_mid, dict):
-            prev_mid = {}
-            data["robot_prev_mid"] = prev_mid
-        zero_buf = data.setdefault("robot_zero_buf", {})
-        if not isinstance(zero_buf, dict):
-            zero_buf = {}
-            data["robot_zero_buf"] = zero_buf
-
-        ema[product] = (1.0 - self.ROBOT_EMA_ALPHA) * float(ema.get(product, mid)) + self.ROBOT_EMA_ALPHA * mid
-        previous_mid = prev_mid.get(product)
-        last_ret = 0.0
-        if previous_mid is not None:
-            last_ret = mid - float(previous_mid)
-            buf = zero_buf.get(product, [])
-            if not isinstance(buf, list):
-                buf = []
-            buf.append(1 if mid == float(previous_mid) else 0)
-            if len(buf) > self.ROBOT_ZERO_WIN:
-                del buf[: len(buf) - self.ROBOT_ZERO_WIN]
-            zero_buf[product] = buf
-        prev_mid[product] = mid
-
-        buf = zero_buf.get(product, [])
-        pct_zero = (sum(buf) / len(buf)) if isinstance(buf, list) and len(buf) >= 50 else 0.0
-        if pct_zero > self.ROBOT_ZERO_THRESH_OU:
-            fair = float(ema[product])
-            bid_off, ask_off = 1, 1
-        elif pct_zero > self.ROBOT_ZERO_THRESH_FADE:
-            fair = mid
-            if last_ret >= self.ROBOT_FADE_THRESH:
-                bid_off, ask_off = 0, 2
-            elif last_ret <= -self.ROBOT_FADE_THRESH:
-                bid_off, ask_off = 2, 0
-            else:
-                bid_off, ask_off = 1, 1
-        else:
-            fair = mid
-            bid_off, ask_off = 1, 1
-
-        return self._robot_snippet_mm_orders(product, depth, fair, pos, bid_off, ask_off)
-
-    @staticmethod
-    def _sleep_l3_imbalance(depth: OrderDepth) -> float:
-        bid_levels = sorted(depth.buy_orders.items(), key=lambda item: -item[0])
-        ask_levels = sorted(depth.sell_orders.items(), key=lambda item: item[0])
-        bid_qty = max(0, int(bid_levels[2][1])) if len(bid_levels) >= 3 else 0
-        ask_qty = max(0, -int(ask_levels[2][1])) if len(ask_levels) >= 3 else 0
-        denom = bid_qty + ask_qty
-        return (bid_qty - ask_qty) / float(denom) if denom > 0 else 0.0
-
-    def _sleep_pod_mids(self, state: TradingState) -> Dict[str, float]:
-        mids: Dict[str, float] = {}
-        for product in self.SLEEP_PODS_FOR_BASKET:
-            depth = state.order_depths.get(product)
-            if depth is None:
-                continue
-            mid = self._mid(depth)
-            if mid is not None:
-                mids[product] = float(mid)
-        return mids
-
-    def _sleep_basket_disagrees(self, product: str, alpha: float, pod_mids: Dict[str, float]) -> bool:
-        if alpha == 0.0:
-            return False
-        cfg = self.SLEEP_BASKET_CONFIG.get(product)
-        if cfg is None or product not in pod_mids:
-            return False
-        beta = cfg["beta"]
-        if any(other not in pod_mids for other in beta):
-            return False
-
-        predicted = float(cfg["intercept"])
-        for other, weight in beta.items():
-            predicted += float(weight) * float(pod_mids[other])
-        residual = float(pod_mids[product]) - predicted
-        z = abs(residual) / max(1e-9, float(cfg["std"]))
-        if z < float(self.SLEEP_BASKET_GATE_Z):
-            return False
-
-        slow_alpha = -residual
-        return float(alpha) * float(slow_alpha) < 0.0
-
-    def _trade_sleep_specialist(
-        self,
-        product: str,
-        depth: OrderDepth,
-        pos: int,
-        pod_mids: Dict[str, float],
-    ) -> List[Order]:
-        best_bid, best_ask, _, _ = self._best(depth)
-        if best_bid is None or best_ask is None:
-            return []
-
-        mid = 0.5 * (best_bid + best_ask)
-        l3_imb = self._sleep_l3_imbalance(depth)
-        if l3_imb == 0.0:
-            return []
-
-        base_fair = mid - float(self.SLEEP_L3_FADE_SCALE[product]) * l3_imb
-        take_fair = mid if self._sleep_basket_disagrees(product, base_fair - mid, pod_mids) else base_fair
-
-        buy_cap = int(self.LIMIT - pos)
-        sell_cap = int(self.LIMIT + pos)
-        orders: List[Order] = []
-
-        for price in sorted(depth.sell_orders):
-            if price > take_fair or buy_cap <= 0:
-                break
-            qty = min(buy_cap, -int(depth.sell_orders[price]))
-            if qty > 0:
-                orders.append(Order(product, int(price), int(qty)))
-                buy_cap -= qty
-
-        for price in sorted(depth.buy_orders, reverse=True):
-            if price < take_fair or sell_cap <= 0:
-                break
-            qty = min(sell_cap, int(depth.buy_orders[price]))
-            if qty > 0:
-                orders.append(Order(product, int(price), -int(qty)))
-                sell_cap -= qty
-
-        return orders
-
-    @staticmethod
-    def _clip_target(target: float, limit: int) -> int:
-        return int(max(-limit, min(limit, round(target))))
-
-    def _pebble_store(self, data: dict) -> dict:
-        store = data.setdefault("pebbles", {})
-        if not isinstance(store, dict):
-            store = {}
-            data["pebbles"] = store
-        return store
-
-    def _pebble_fv_state_target(
-        self,
-        product: str,
-        mid: float,
-        pos: int,
-        store: dict,
-        slope: float,
-        exit_threshold: float,
-        long_threshold: float,
-        short_reentry_threshold: float,
-    ) -> int:
-        rec = store.setdefault(product, {})
-        if not isinstance(rec, dict):
-            rec = {}
-            store[product] = rec
-
-        t = int(rec.get("t", 0))
-        residual_sum = float(rec.get("sum", 0.0)) + float(mid) - float(slope) * float(t)
-        n = int(rec.get("n", 0)) + 1
-        intercept = residual_sum / float(max(1, n))
-        fair = float(slope) * float(t) + intercept
-
-        if t == 0:
-            target = -self.LIMIT
-        elif mid < fair + float(long_threshold):
-            target = self.LIMIT
-        elif mid < fair + float(exit_threshold) and pos <= 0:
-            target = 0
-        elif mid > fair + float(short_reentry_threshold):
-            target = -self.LIMIT
-        else:
-            target = pos
-
-        rec["t"] = t + 1
-        rec["sum"] = residual_sum
-        rec["n"] = n
-        return int(max(-self.LIMIT, min(self.LIMIT, target)))
-
-    def _pebble_s_target(self, mid: float, store: dict) -> int:
-        rec = store.setdefault("PEBBLES_S", {})
-        if not isinstance(rec, dict):
-            rec = {}
-            store["PEBBLES_S"] = rec
-
-        t = int(rec.get("t", 0))
-        residual_sum = float(rec.get("sum", 0.0)) + float(mid) - float(self.PEBBLE_S_M) * float(t)
-        n = int(rec.get("n", 0)) + 1
-        intercept = residual_sum / float(max(1, n))
-        fair = float(self.PEBBLE_S_M) * float(t) + intercept
-        residual = float(mid) - fair
-
-        side = int(rec.get("side", 0))
-        peak = float(rec.get("peak", 0.0))
-        if abs(residual) < float(self.PEBBLE_S_NEUTRAL_BAND):
-            side = 0
-            peak = 0.0
-            ratchet = 0
-        else:
-            new_side = -1 if residual > 0 else 1
-            if new_side != side:
-                side = new_side
-                peak = 0.0
-            peak = max(peak, abs(residual))
-            if peak <= float(self.PEBBLE_S_DEAD_ZONE) or self.PEBBLE_S_SCALE <= self.PEBBLE_S_DEAD_ZONE:
-                ratchet = 0
-            else:
-                mag = min((peak - float(self.PEBBLE_S_DEAD_ZONE)) / (float(self.PEBBLE_S_SCALE) - float(self.PEBBLE_S_DEAD_ZONE)), 1.0)
-                ratchet = int(round(float(side) * mag * float(self.LIMIT)))
-
-        rec["t"] = t + 1
-        rec["sum"] = residual_sum
-        rec["n"] = n
-        rec["side"] = side
-        rec["peak"] = peak
-        return int(max(-self.LIMIT, min(self.LIMIT, ratchet + int(self.PEBBLE_S_POSITION_OFFSET))))
-
-    def _pebble_anchor_target(
-        self,
-        product: str,
-        mid: float,
-        store: dict,
-        anchor: float,
-        neutral_band: float,
-        dead_zone: float,
-        scale: float,
-    ) -> int:
-        rec = store.setdefault(product, {})
-        if not isinstance(rec, dict):
-            rec = {}
-            store[product] = rec
-
-        diff = float(mid) - float(anchor)
-        side = int(rec.get("side", 0))
-        peak = float(rec.get("peak", 0.0))
-        if abs(diff) < float(neutral_band):
-            side = 0
-            peak = 0.0
-            target = 0
-        else:
-            new_side = -1 if diff > 0 else 1
-            if new_side != side:
-                side = new_side
-                peak = 0.0
-            peak = max(peak, abs(diff))
-            if peak <= float(dead_zone) or scale <= dead_zone:
-                target = 0
-            else:
-                mag = min((peak - float(dead_zone)) / (float(scale) - float(dead_zone)), 1.0)
-                target = int(round(float(side) * mag * float(self.LIMIT)))
-
-        rec["side"] = side
-        rec["peak"] = peak
-        return int(max(-self.LIMIT, min(self.LIMIT, target)))
-
-    def _pebble_specialist_targets(self, state: TradingState, data: dict) -> Dict[str, int]:
-        store = self._pebble_store(data)
-        targets: Dict[str, int] = {}
-
-        xs_depth = state.order_depths.get("PEBBLES_XS")
-        xs_mid = self._mid(xs_depth) if xs_depth is not None else None
-        if xs_mid is not None:
-            targets["PEBBLES_XS"] = self._pebble_fv_state_target(
-                "PEBBLES_XS",
-                float(xs_mid),
-                int(state.position.get("PEBBLES_XS", 0)),
-                store,
-                float(self.PEBBLE_XS_M),
-                float(self.PEBBLE_XS_EXIT_THRESHOLD),
-                float(self.PEBBLE_XS_LONG_THRESHOLD),
-                float(self.PEBBLE_XS_SHORT_RE_ENTRY_THRESHOLD),
-            )
-
-        s_depth = state.order_depths.get("PEBBLES_S")
-        s_mid = self._mid(s_depth) if s_depth is not None else None
-        if s_mid is not None:
-            targets["PEBBLES_S"] = self._pebble_s_target(float(s_mid), store)
-
-        m_depth = state.order_depths.get("PEBBLES_M")
-        m_mid = self._mid(m_depth) if m_depth is not None else None
-        if m_mid is not None:
-            targets["PEBBLES_M"] = self._pebble_anchor_target(
-                "PEBBLES_M",
-                float(m_mid),
-                store,
-                float(self.PEBBLE_M_ANCHOR),
-                float(self.PEBBLE_M_NEUTRAL_BAND),
-                float(self.PEBBLE_M_DEAD_ZONE),
-                float(self.PEBBLE_M_SCALE),
-            )
-
-        l_depth = state.order_depths.get("PEBBLES_L")
-        l_mid = self._mid(l_depth) if l_depth is not None else None
-        if l_mid is not None:
-            targets["PEBBLES_L"] = self._pebble_anchor_target(
-                "PEBBLES_L",
-                float(l_mid),
-                store,
-                float(self.PEBBLE_L_ANCHOR),
-                float(self.PEBBLE_L_NEUTRAL_BAND),
-                float(self.PEBBLE_L_DEAD_ZONE),
-                float(self.PEBBLE_L_SCALE),
-            )
-
-        if state.order_depths.get("PEBBLES_XL") is not None and targets:
-            weighted_sum = sum(float(self.PEBBLE_XL_WEIGHTS[p]) * float(t) for p, t in targets.items() if p in self.PEBBLE_XL_WEIGHTS)
-            targets["PEBBLES_XL"] = self._clip_target(-weighted_sum, self.LIMIT)
-
-        return targets
-
-    def _trade_pebble_specialist(self, product: str, depth: OrderDepth, pos: int, target: int) -> List[Order]:
-        delta = int(target) - int(pos)
-        if delta == 0:
-            return []
-
-        orders: List[Order] = []
-        if delta > 0:
-            remaining = min(delta, self.LIMIT - pos)
-            for ask_price in sorted(depth.sell_orders.keys()):
-                if remaining <= 0:
-                    break
-                qty = min(remaining, -int(depth.sell_orders[ask_price]))
-                if qty > 0:
-                    orders.append(Order(product, int(ask_price), int(qty)))
-                    remaining -= qty
-        else:
-            remaining = min(-delta, self.LIMIT + pos)
-            for bid_price in sorted(depth.buy_orders.keys(), reverse=True):
-                if remaining <= 0:
-                    break
-                qty = min(remaining, int(depth.buy_orders[bid_price]))
-                if qty > 0:
-                    orders.append(Order(product, int(bid_price), -int(qty)))
-                    remaining -= qty
-
-        return orders
-
-    def _panel_store(self, data: dict) -> dict:
-        store = data.setdefault("panels", {})
-        if not isinstance(store, dict):
-            store = {}
-            data["panels"] = store
-        for key in ("spread_history", "mid_history", "pair_targets", "momentum_targets", "lead_lag_targets", "lead_lag_entry_ts"):
-            if not isinstance(store.get(key), dict):
-                store[key] = {}
-        return store
-
-    def _panel_push(self, store: dict, bucket: str, key: str, value: float) -> list:
-        series = store[bucket].get(key, [])
-        if not isinstance(series, list):
-            series = []
-        series.append(float(value))
-        if len(series) > int(self.PANEL_MAX_HISTORY):
-            del series[: len(series) - int(self.PANEL_MAX_HISTORY)]
-        store[bucket][key] = series
-        return series
-
-    def _panel_mean_std(self, values: List[float], window: int):
-        sample = values[-int(window):]
-        if len(sample) < max(30, int(window) // 4):
-            return None
-        mu = sum(float(x) for x in sample) / float(len(sample))
-        var = sum((float(x) - mu) ** 2 for x in sample) / float(len(sample))
-        return mu, max(math.sqrt(max(0.0, var)), float(self.PANEL_MIN_STD))
-
-    def _panel_pair_target(self, store: dict, key: str, spread: float, window: int, entry_z: float, exit_z: float, size: int) -> int:
-        series = self._panel_push(store, "spread_history", key, spread)
-        stats = self._panel_mean_std(series[:-1], int(window))
-        previous = int(store["pair_targets"].get(key, 0))
-        if stats is None:
-            return previous
-        mu, sd = stats
-        z = (float(spread) - mu) / sd
-        if z > float(entry_z):
-            target = -int(size)
-        elif z < -float(entry_z):
-            target = int(size)
-        elif abs(z) < float(exit_z):
-            target = 0
-        else:
-            target = previous
-        store["pair_targets"][key] = int(target)
-        return int(target)
-
-    def _panel_momentum_target(self, store: dict, product: str, mid: float, lookback: int, z_mult: float, size: int) -> int:
-        series = self._panel_push(store, "mid_history", product, mid)
-        previous = int(store["momentum_targets"].get(product, 0))
-        lookback = int(lookback)
-        if len(series) < lookback + 30:
-            return previous
-        sample = series[-lookback - 1:]
-        returns = [float(sample[i]) - float(sample[i - 1]) for i in range(1, len(sample))]
-        ret_std = max(math.sqrt(sum(r * r for r in returns) / float(max(1, len(returns)))), float(self.PANEL_MIN_STD))
-        move = float(series[-1]) - float(series[-lookback])
-        threshold = float(z_mult) * ret_std * math.sqrt(float(lookback))
-        if move > threshold:
-            target = int(size)
-        elif move < -threshold:
-            target = -int(size)
-        elif abs(move) < 0.35 * threshold:
-            target = 0
-        else:
-            target = previous
-        store["momentum_targets"][product] = int(target)
-        return int(target)
-
-    def _panel_move_std(self, values: list, lookback: int):
-        lookback = int(lookback)
-        if len(values) < lookback + 30:
-            return None
-        moves = [float(values[i]) - float(values[i - lookback]) for i in range(lookback, len(values))]
-        mu = sum(moves) / float(max(1, len(moves)))
-        var = sum((x - mu) ** 2 for x in moves) / float(max(1, len(moves)))
-        return max(math.sqrt(max(0.0, var)), float(self.PANEL_MIN_STD))
-
-    def _panel_lead_lag_target(
-        self,
-        store: dict,
-        leader: str,
-        follower: str,
-        leader_mid: float,
-        lookback: int,
-        entry_z: float,
-        direction: int,
-        max_hold: int,
-        timestamp: int,
-    ) -> int:
-        series = store["mid_history"].get(leader, [])
-        if not isinstance(series, list):
-            series = []
-        key = f"{leader}|{follower}"
-        previous = int(store["lead_lag_targets"].get(key, 0))
-        target = previous
-        lookback = int(lookback)
-        if len(series) >= lookback + 30:
-            sd = self._panel_move_std(series, lookback)
-            if sd is not None:
-                move = float(leader_mid) - float(series[-lookback])
-                if previous == 0:
-                    if move > float(entry_z) * sd:
-                        target = int(direction) * self.LIMIT
-                        store["lead_lag_entry_ts"][key] = int(timestamp)
-                    elif move < -float(entry_z) * sd:
-                        target = -int(direction) * self.LIMIT
-                        store["lead_lag_entry_ts"][key] = int(timestamp)
-                else:
-                    age = int(timestamp) - int(store["lead_lag_entry_ts"].get(key, timestamp))
-                    if age >= int(max_hold) * 100:
-                        target = 0
-                        store["lead_lag_entry_ts"].pop(key, None)
-        store["lead_lag_targets"][key] = int(target)
-        return int(target)
-
-    def _panel_specialist_targets(self, state: TradingState, data: dict) -> Dict[str, int]:
-        store = self._panel_store(data)
-        raw_targets: Dict[str, int] = {}
-
-        for a, b, window, entry_z, exit_z, size in self.PANEL_PAIRS:
-            mid_a = self._mid(state.order_depths.get(a))
-            mid_b = self._mid(state.order_depths.get(b))
-            if mid_a is None or mid_b is None:
-                continue
-            target = self._panel_pair_target(store, f"{a}|{b}", float(mid_a) - float(mid_b), int(window), float(entry_z), float(exit_z), int(size))
-            raw_targets[a] = raw_targets.get(a, 0) + target
-            raw_targets[b] = raw_targets.get(b, 0) - target
-
-        for product, (lookback, z_mult, size) in self.PANEL_MOMENTUM.items():
-            mid = self._mid(state.order_depths.get(product))
-            if mid is None:
-                continue
-            target = self._panel_momentum_target(store, product, float(mid), int(lookback), float(z_mult), int(size))
-            raw_targets[product] = raw_targets.get(product, 0) + target
-
-        lead_lag_leaders = {leader for leader, *_ in self.PANEL_LEAD_LAG if leader not in self.PANEL_MOMENTUM}
-        for product in lead_lag_leaders:
-            mid = self._mid(state.order_depths.get(product))
-            if mid is not None:
-                self._panel_push(store, "mid_history", product, float(mid))
-
-        for leader, follower, lookback, entry_z, direction, max_hold in self.PANEL_LEAD_LAG:
-            leader_mid = self._mid(state.order_depths.get(leader))
-            follower_mid = self._mid(state.order_depths.get(follower))
-            if leader_mid is None or follower_mid is None:
-                continue
-            target = self._panel_lead_lag_target(
-                store,
-                leader,
-                follower,
-                float(leader_mid),
-                int(lookback),
-                float(entry_z),
-                int(direction),
-                int(max_hold),
-                int(state.timestamp),
-            )
-            raw_targets[follower] = raw_targets.get(follower, 0) + target
-
-        for product, target in self.PANEL_DIRECTIONAL_TARGETS.items():
-            raw_targets[product] = raw_targets.get(product, 0) + int(target)
-
-        return {product: max(-self.LIMIT, min(self.LIMIT, int(target))) for product, target in raw_targets.items()}
-
-    def _trade_panel_specialist(self, product: str, depth: OrderDepth, pos: int, target: int) -> List[Order]:
-        return self._trade_pebble_specialist(product, depth, pos, target)
-
     def _trade_cotton_reversion(self, state: TradingState, pos: int) -> List[Order]:
         prod = "SLEEP_POD_COTTON"
         depth = state.order_depths.get(prod)
@@ -1998,30 +1098,16 @@ class Trader:
 
         scores = self._update_features(state, data)
         fair_adjs = self._compute_fair_adjs(all_mids, data)
-        snack_targets = {}
-        sb = data.get("snack_basket", {})
-        if isinstance(sb, dict):
-            tgt = sb.get("tgt", {})
-            if isinstance(tgt, dict):
-                snack_targets = tgt
         result: Dict[Symbol, List[Order]] = {}
 
         # --- Galaxy pairs ---
         g_hist, g_tgt = self._GALAXY.load_state(data.get("galaxy", {}))
         galaxy_orders, g_next_tgt = self._GALAXY.run(state, g_hist, g_tgt)
         data["galaxy"] = self._GALAXY.dump_state(g_hist, g_next_tgt)
-        active_galaxy_products = set()
-        for name, prod_a, prod_b, *_ in self._GALAXY.PAIRS:
-            if int(g_next_tgt.get(name, 0)) != 0:
-                active_galaxy_products.add(prod_a)
-                active_galaxy_products.add(prod_b)
-        galaxy_handled: set = set(galaxy_orders.keys()) | active_galaxy_products
+        galaxy_handled: set = set(galaxy_orders.keys())
         result.update(galaxy_orders)
 
         dishes_hist_in = list(data.get("dishes_mid_hist") or []) if isinstance(data.get("dishes_mid_hist"), list) else []
-        sleep_pod_mids = self._sleep_pod_mids(state)
-        pebble_targets = self._pebble_specialist_targets(state, data)
-        panel_targets = self._panel_specialist_targets(state, data)
 
         for product in self.PRODUCTS:
             if product in self.BLOCKED_PRODUCTS:
@@ -2041,23 +1127,7 @@ class Trader:
 
             krec = data.get("kalman", {}).get(product)
             kalman_x = float(krec[0]) if isinstance(krec, list) and len(krec) == 2 else float(mid)
-            if product in self.PEBBLE_SPECIALIST_PRODUCTS:
-                if product in pebble_targets:
-                    orders = self._trade_pebble_specialist(product, depth, pos, int(pebble_targets[product]))
-                else:
-                    orders = []
-            elif product in self.PANEL_SPECIALIST_PRODUCTS:
-                if product in panel_targets:
-                    orders = self._trade_panel_specialist(product, depth, pos, int(panel_targets[product]))
-                else:
-                    orders = []
-            elif product in self.ROBOT_SNIPPET_PRODUCTS:
-                orders = self._trade_robot_snippet(product, depth, pos, data)
-            elif product.startswith("GALAXY_SOUNDS_"):
-                orders = self._simple_mm(product, depth, pos)
-            elif product in self.SLEEP_SPECIALIST_PRODUCTS:
-                orders = self._trade_sleep_specialist(product, depth, pos, sleep_pod_mids)
-            elif product == "ROBOT_DISHES":
+            if product == "ROBOT_DISHES":
                 od, new_hist = self._trade_dishes_risk_managed(
                     depth,
                     float(mid),
@@ -2075,6 +1145,10 @@ class Trader:
                 orders = self._alpha_trend_max_short(product, depth, pos)
             elif product in self.TRANSLATOR_PRODUCTS:
                 orders = self._trade_translator(product, depth, pos, data, float(mid), fair_adjs.get(product, 0.0))
+            elif product in self._SIMPLE_MM_PRODUCTS:
+                # For very noisy / spread-driven products, avoid taker logic and just quote inside spread.
+                # This is also the only path that meaningfully trades SLEEP_POD_LAMB_WOOL.
+                orders = self._simple_mm(product, depth, pos)
 
             if orders is not None:
                 if orders:
@@ -2095,8 +1169,7 @@ class Trader:
                 float(scores.get(product, 0.0)),
                 trend_target,
                 float(kalman_x),
-                fair_adjs.get(product, 0.0)
-                + (float(self.SNACK_INV_LAMBDA) * (float(snack_targets.get(product, 0)) - float(pos)) if product in self.SNACK_PRODUCTS else 0.0),
+                fair_adjs.get(product, 0.0),
             )
             if default_orders:
                 clipped = self._clip_orders_to_position_limit(
